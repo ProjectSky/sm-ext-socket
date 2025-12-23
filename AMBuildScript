@@ -1,0 +1,236 @@
+# vim: set sts=2 ts=8 sw=2 tw=99 et ft=python:
+import os
+
+def SetArchFlags(compiler):
+  if compiler.like('msvc'):
+    if compiler.target.arch == 'x86_64':
+      compiler.defines += ['WIN64']
+    else:
+      compiler.defines += ['WIN32']
+
+class ExtensionConfig(object):
+	def __init__(self):
+		self.extensions = []
+		self.sm_root = None
+		self.all_targets = []
+		self.target_archs = set()
+
+		if builder.options.targets:
+			target_archs = builder.options.targets.split(',')
+		else:
+			target_archs = ['x86']
+
+		for arch in target_archs:
+			try:
+				cxx = builder.DetectCxx(target_arch=arch)
+				self.target_archs.add(cxx.target.arch)
+			except Exception as e:
+				if builder.options.targets:
+					raise
+				print('Skipping target {}: {}'.format(arch, e))
+				continue
+			self.all_targets.append(cxx)
+
+		if not self.all_targets:
+			raise Exception('No suitable C/C++ compiler was found.')
+
+	def detectSourceMod(self):
+		if builder.options.sm_path:
+			self.sm_root = builder.options.sm_path
+		else:
+			raise Exception('SourceMod path not specified')
+
+		if not self.sm_root or not os.path.isdir(self.sm_root):
+			raise Exception('Could not find a source copy of SourceMod')
+
+		self.sm_root = os.path.abspath(os.path.normpath(self.sm_root))
+
+	def configure(self):
+		for cxx in self.all_targets:
+			self.configure_cxx(cxx)
+
+	def configure_cxx(self, cxx):
+		if cxx.family == 'msvc':
+			if cxx.version < 1914 and builder.options.generator != 'vs':
+				raise Exception('Only MSVC 2017 15.7 and later are supported, full C++17 support is required.')
+		elif cxx.family == 'gcc':
+			if cxx.version < 'gcc-9':
+				raise Exception('Only GCC versions 9 or later are supported, full C++17 support is required.')
+		elif cxx.family == 'clang':
+			if cxx.version < 'clang-5':
+				raise Exception('Only clang versions 5 or later are supported, full C++17 support is required.')
+
+		if cxx.like('gcc'):
+			self.configure_gcc(cxx)
+		elif cxx.family == 'msvc':
+			self.configure_msvc(cxx)
+
+		# Optimization
+		if builder.options.opt == '1':
+			cxx.defines += ['NDEBUG']
+
+		# Debugging
+		if builder.options.debug == '1':
+			cxx.defines += ['DEBUG', '_DEBUG']
+
+		# Platform-specifics
+		if cxx.target.platform == 'linux':
+			self.configure_linux(cxx)
+		elif cxx.target.platform == 'windows':
+			self.configure_windows(cxx)
+
+		# Finish up.
+		cxx.includes += [
+			os.path.join(self.sm_root, 'public'),
+		]
+
+	def configure_gcc(self, cxx):
+		cxx.defines += [
+			'stricmp=strcasecmp',
+			'_stricmp=strcasecmp',
+			'_snprintf=snprintf',
+			'_vsnprintf=vsnprintf',
+			'HAVE_STDINT_H',
+			'GNUC',
+		]
+
+		cxx.cflags += [
+			'-pipe',
+			'-fno-strict-aliasing',
+			'-Wall',
+			'-fvisibility=hidden',
+			'-fPIC',
+		]
+
+		# Clang-specific warnings
+		if cxx.family == 'clang':
+			cxx.cflags += ['-Wno-sometimes-uninitialized']
+			cxx.cxxflags += ['-Wno-implicit-exception-spec-mismatch']
+
+		cxx.cxxflags += ['-std=c++17']
+
+		cxx.cxxflags += [
+			'-fno-threadsafe-statics',
+			'-fvisibility-inlines-hidden',
+		]
+
+		# Clang version-specific warnings
+		if cxx.family == 'clang':
+			if cxx.version >= 'clang-3.4' or cxx.version >= 'apple-clang-7.0':
+				cxx.cxxflags += ['-Wno-inconsistent-missing-override']
+			if cxx.version >= 'apple-clang-5.1' or cxx.version >= 'clang-3.4':
+				cxx.cxxflags += ['-Wno-deprecated-register']
+
+		# GCC version-specific warnings
+		if cxx.family == 'gcc' and cxx.version >= 'gcc-9.0':
+			cxx.cxxflags += ['-Wno-class-memaccess']
+
+		if builder.options.opt == '1':
+			cxx.cflags += ['-O2']
+
+		# Keep frame pointer for debugging
+		cxx.cflags += ['-fno-omit-frame-pointer']
+
+	def configure_msvc(self, cxx):
+		if builder.options.debug == '1':
+			cxx.cflags += ['/MTd']
+		else:
+			cxx.cflags += ['/MT']
+
+		cxx.defines += [
+			'_CRT_SECURE_NO_WARNINGS',
+			'_CRT_NONSTDC_NO_DEPRECATE',
+		]
+
+		cxx.cflags += ['/W3']
+
+		cxx.cxxflags += [
+			'/std:c++17',
+			'/EHsc',
+			'/GR-',
+			'/TP',
+		]
+
+		cxx.linkflags += [
+			'kernel32.lib',
+			'advapi32.lib',
+			'user32.lib',
+			'ws2_32.lib',
+			'iphlpapi.lib',
+			'userenv.lib',
+			'psapi.lib',
+			'ole32.lib',
+			'dbghelp.lib',
+			'shell32.lib',
+		]
+
+		if builder.options.opt == '1':
+			cxx.cflags += ['/Ox', '/Zo']
+			cxx.linkflags += ['/OPT:ICF', '/OPT:REF']
+
+		if builder.options.debug == '1':
+			cxx.cflags += ['/Od', '/RTC1']
+
+		# Keep frame pointer
+		cxx.cflags += ['/Oy-']
+
+	def configure_linux(self, cxx):
+		cxx.defines += ['_LINUX', 'POSIX']
+		cxx.linkflags += ['-Wl,--exclude-libs,ALL', '-lm']
+
+		if builder.options.opt == '1':
+			cxx.linkflags += ['-s']
+
+		if cxx.family == 'gcc':
+			cxx.linkflags += ['-static-libgcc']
+		elif cxx.family == 'clang':
+			cxx.linkflags += ['-lgcc_eh']
+
+		cxx.linkflags += ['-static-libstdc++']
+
+	def configure_windows(self, cxx):
+		cxx.defines += [
+			'_WINDOWS',
+			'_WIN32_WINNT=0x0602',
+		]
+
+	def Library(self, context, compiler, name):
+		compiler = compiler.clone()
+		SetArchFlags(compiler)
+		self.ConfigureForExtension(context, compiler)
+		return compiler.Library(name)
+
+	def StaticLibrary(self, context, compiler, name):
+		compiler = compiler.clone()
+		return compiler.StaticLibrary(name)
+
+	def ConfigureForExtension(self, context, compiler):
+		compiler.cxxincludes += [
+			os.path.join(context.currentSourcePath),
+			os.path.join(self.sm_root, 'public'),
+			os.path.join(self.sm_root, 'public', 'extensions'),
+			os.path.join(self.sm_root, 'sourcepawn', 'include'),
+			os.path.join(self.sm_root, 'public', 'amtl', 'amtl'),
+			os.path.join(self.sm_root, 'public', 'amtl'),
+		]
+		return compiler
+
+Extension = ExtensionConfig()
+Extension.detectSourceMod()
+Extension.configure()
+
+# This will clone the list and each cxx object as we recurse, preventing child
+# scripts from messing up global state.
+builder.targets = builder.CloneableList(Extension.all_targets)
+
+# Add additional buildscripts here
+BuildScripts = [
+	'AMBuilder',
+]
+
+if builder.backend == 'amb2':
+	BuildScripts += [
+		'PackageScript',
+	]
+
+builder.Build(BuildScripts, {'Extension': Extension})

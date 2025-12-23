@@ -1,0 +1,33 @@
+# vim: set ts=8 sts=2 sw=2 tw=99 et ft=python:
+import os
+
+builder.SetBuildFolder('package')
+
+# Folder structure: (dest_folder, src_folder or None for extensions)
+folder_list = [
+  ('addons/sourcemod/extensions', None),
+  ('addons/sourcemod/scripting/include', 'scripting/include'),
+]
+
+if 'x86_64' in Extension.target_archs:
+  folder_list.append(('addons/sourcemod/extensions/x64', None))
+
+# Create folder hierarchy
+folder_map = {}
+for dest, src in folder_list:
+  folder_map[dest] = builder.AddFolder(os.path.normpath(dest))
+
+# Copy binaries
+for cxx_task in Extension.extensions:
+  if cxx_task.target.arch == 'x86_64':
+    builder.AddCopy(cxx_task.binary, folder_map['addons/sourcemod/extensions/x64'])
+  else:
+    builder.AddCopy(cxx_task.binary, folder_map['addons/sourcemod/extensions'])
+
+# Copy include files
+for dest, src in folder_list:
+  if src:
+    src_path = os.path.join(builder.sourcePath, src)
+    for f in os.listdir(src_path):
+      if f.endswith('.inc'):
+        builder.AddCopy(os.path.join(src_path, f), folder_map[dest])

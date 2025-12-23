@@ -1,0 +1,105 @@
+# vim: sts=2 ts=8 sw=2 tw=99 et ft=python:
+import os
+
+builder.SetBuildFolder('libuv')
+
+rvalue = {}
+for cxx in builder.targets:
+  binary = Extension.StaticLibrary(builder, cxx, 'uv')
+
+  binary.compiler.includes += [
+    os.path.join(builder.sourcePath, 'third_party', 'libuv', 'include'),
+    os.path.join(builder.sourcePath, 'third_party', 'libuv', 'src'),
+  ]
+
+  if binary.compiler.target.platform == 'linux':
+    binary.compiler.defines += ['_GNU_SOURCE']
+
+  if binary.compiler.family == 'clang':
+    binary.compiler.cflags += ['-Wno-attributes']
+
+  # Common sources
+  binary.sources += [
+    'libuv/src/fs-poll.c',
+    'libuv/src/idna.c',
+    'libuv/src/inet.c',
+    'libuv/src/random.c',
+    'libuv/src/strscpy.c',
+    'libuv/src/strtok.c',
+    'libuv/src/thread-common.c',
+    'libuv/src/threadpool.c',
+    'libuv/src/timer.c',
+    'libuv/src/uv-common.c',
+    'libuv/src/uv-data-getter-setters.c',
+    'libuv/src/version.c',
+  ]
+
+  if binary.compiler.target.platform == 'windows':
+    binary.sources += [
+      'libuv/src/win/async.c',
+      'libuv/src/win/core.c',
+      'libuv/src/win/detect-wakeup.c',
+      'libuv/src/win/dl.c',
+      'libuv/src/win/error.c',
+      'libuv/src/win/fs.c',
+      'libuv/src/win/fs-event.c',
+      'libuv/src/win/getaddrinfo.c',
+      'libuv/src/win/getnameinfo.c',
+      'libuv/src/win/handle.c',
+      'libuv/src/win/loop-watcher.c',
+      'libuv/src/win/pipe.c',
+      'libuv/src/win/thread.c',
+      'libuv/src/win/poll.c',
+      'libuv/src/win/process.c',
+      'libuv/src/win/process-stdio.c',
+      'libuv/src/win/signal.c',
+      'libuv/src/win/snprintf.c',
+      'libuv/src/win/stream.c',
+      'libuv/src/win/tcp.c',
+      'libuv/src/win/tty.c',
+      'libuv/src/win/udp.c',
+      'libuv/src/win/util.c',
+      'libuv/src/win/winapi.c',
+      'libuv/src/win/winsock.c',
+    ]
+  else:
+    binary.sources += [
+      'libuv/src/unix/async.c',
+      'libuv/src/unix/core.c',
+      'libuv/src/unix/dl.c',
+      'libuv/src/unix/fs.c',
+      'libuv/src/unix/getaddrinfo.c',
+      'libuv/src/unix/getnameinfo.c',
+      'libuv/src/unix/loop-watcher.c',
+      'libuv/src/unix/loop.c',
+      'libuv/src/unix/pipe.c',
+      'libuv/src/unix/poll.c',
+      'libuv/src/unix/process.c',
+      'libuv/src/unix/random-devurandom.c',
+      'libuv/src/unix/signal.c',
+      'libuv/src/unix/stream.c',
+      'libuv/src/unix/tcp.c',
+      'libuv/src/unix/thread.c',
+      'libuv/src/unix/tty.c',
+      'libuv/src/unix/udp.c',
+      'libuv/src/unix/proctitle.c',
+    ]
+
+    if binary.compiler.target.platform == 'linux':
+      binary.sources += [
+        'libuv/src/unix/linux.c',
+        'libuv/src/unix/procfs-exepath.c',
+        'libuv/src/unix/random-getrandom.c',
+        'libuv/src/unix/random-sysctl-linux.c',
+      ]
+    elif binary.compiler.target.platform == 'mac':
+      binary.sources += [
+        'libuv/src/unix/bsd-ifaddrs.c',
+        'libuv/src/unix/kqueue.c',
+        'libuv/src/unix/random-getentropy.c',
+        'libuv/src/unix/darwin-proctitle.c',
+        'libuv/src/unix/darwin.c',
+        'libuv/src/unix/fsevents.c',
+      ]
+
+  rvalue[binary.compiler.target.arch] = builder.Add(binary)

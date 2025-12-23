@@ -1,0 +1,158 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "main"
+    paths:
+      - "src/**"
+      - "third_party/**"
+  pull_request:
+    paths:
+      - "src/**"
+      - "third_party/**"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Extension (sm${{ matrix.sm_version }}, ${{ matrix.os_short }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-22.04
+          - windows-latest
+        sm_version:
+          - "1.11"
+          - "latest"
+
+        include:
+          - sm_version: latest
+            sm_branch: master
+
+          - sm_version: "1.11"
+            sm_branch: "1.11-dev"
+
+          - os: windows-latest
+            os_short: win
+
+          - os: ubuntu-latest
+            os_short: linux
+
+          - os: ubuntu-22.04
+            os_short: linux-ubuntu-22.04
+
+    steps:
+      - name: Prepare env
+        shell: bash
+        run: |
+          echo "GITHUB_SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Install (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y clang g++-multilib
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+
+      - name: Getting SourceMod ${{ matrix.sm_version }}
+        uses: actions/checkout@v4
+        with:
+          repository: alliedmodders/sourcemod
+          ref: ${{ matrix.sm_branch }}
+          path: sourcemod-${{ matrix.sm_version }}
+          submodules: recursive
+
+      - name: Setting up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Getting ambuild
+        run: |
+          python -m pip install wheel
+          pip install git+https://github.com/alliedmodders/ambuild
+
+      - name: Getting own repository
+        uses: actions/checkout@v4
+        with:
+          path: extension
+          submodules: recursive
+
+      - uses: microsoft/setup-msbuild@v2
+        if: runner.os == 'Windows'
+        with:
+            msbuild-architecture: x64
+            vs-version: '15'
+
+      - name: Compiling ${{ github.event.repository.name }} files
+        working-directory: extension
+        run: |
+          mkdir build
+          cd build
+          python ../configure.py --enable-optimize --sm-path="${{ github.workspace }}/sourcemod-${{ matrix.sm_version }}" --targets=x86,x64
+          ambuild
+
+      - name: Uploading package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm-ext-socket-sm${{ matrix.sm_version }}-${{ matrix.os_short }}-${{ env.GITHUB_SHA_SHORT }}
+          path: extension/build/package
+
+  create-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: extension
+          sparse-checkout: |
+            src/smsdk_config.h
+
+      - name: Get version from smsdk_config.h
+        id: get_version
+        run: |
+          VERSION=$(grep '#define SMEXT_CONF_VERSION' extension/src/smsdk_config.h | awk -F '"' '{print $2}')
+          if [ -z "$VERSION" ]; then
+            echo "Error: Could not find version in smsdk_config.h"
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate Release Notes
+        run: echo "${{ github.event.head_commit.message }}" >> release_notes.md
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release Archives
+        run: |
+          cd artifacts
+          for dir in sm-ext-socket-*; do
+            7z a "../${dir}.zip" "./${dir}/"*
+          done
+
+      - name: Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.version }}
+          name: Release ${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+          body_path: release_notes.md
+          files: |
+            sm-ext-socket-*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

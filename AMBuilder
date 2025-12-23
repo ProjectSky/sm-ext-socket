@@ -1,0 +1,38 @@
+# vim: set sts=2 ts=8 sw=2 tw=99 et ft=python:
+import os
+
+libuv = builder.Build('third_party/libuv.AMBuilder')
+
+for cxx in builder.targets:
+  binary = Extension.Library(builder, cxx, 'socket.ext')
+  arch = binary.compiler.target.arch
+
+  binary.sources += [
+    'src/extension.cpp',
+    'src/natives/socket_natives.cpp',
+    'src/impl/core/EventLoop.cpp',
+    'src/impl/core/SocketManager.cpp',
+    'src/impl/core/CallbackManager.cpp',
+    'src/impl/socket/SocketBase.cpp',
+    'src/impl/socket/TcpSocket.cpp',
+    'src/impl/socket/UdpSocket.cpp',
+    'src/impl/socket/SocketUtils.cpp',
+    os.path.join(Extension.sm_root, 'public', 'smsdk_ext.cpp'),
+  ]
+
+  binary.compiler.includes += [
+    os.path.join(builder.sourcePath, 'src'),
+    os.path.join(builder.sourcePath, 'src', 'include'),
+    os.path.join(builder.sourcePath, 'third_party', 'libuv', 'include'),
+  ]
+
+  if binary.compiler.target.platform == 'linux':
+    binary.compiler.postlink += ['-lpthread', '-lrt']
+  elif binary.compiler.target.platform == 'windows':
+    binary.sources += ['src/version.rc']
+
+  binary.compiler.postlink += [
+    libuv[arch].binary,
+  ]
+
+  Extension.extensions += [builder.Add(binary)]
