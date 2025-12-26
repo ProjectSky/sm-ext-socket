@@ -2,11 +2,19 @@
 
 #include "socket/SocketBase.h"
 #include <uv.h>
-#include <memory>
-#include <functional>
+#include <atomic>
 
 class TcpSocket;
 
+/**
+ * TCP socket implementation using libuv.
+ *
+ * Thread safety:
+ * - m_socket, m_acceptor: atomic pointers for lock-free access
+ * - m_remoteEndpoint: only written from UV thread, read from game thread
+ *   (uses atomic_thread_fence for synchronization)
+ * - All other state follows SocketBase thread safety model
+ */
 class TcpSocket : public SocketBase {
 public:
 	TcpSocket();
@@ -30,8 +38,6 @@ public:
 private:
 	void InitSocket();
 
-	void ApplyPendingOptions();
-
 	static void OnResolved(uv_getaddrinfo_t* request, int status, struct addrinfo* addressInfo);
 	static void OnConnect(uv_connect_t* request, int status);
 	static void OnConnection(uv_stream_t* server, int status);
@@ -45,16 +51,20 @@ private:
 	void StartReceiving();
 	void CancelConnectTimeout();
 
-	uv_tcp_t* m_socket = nullptr;
-	uv_tcp_t* m_acceptor = nullptr;
+	// Atomic socket pointers for lock-free access
+	std::atomic<uv_tcp_t*> m_socket{nullptr};
+	std::atomic<uv_tcp_t*> m_acceptor{nullptr};
+
 	uv_timer_t* m_connectTimer = nullptr;
 	sockaddr_storage m_localAddr{};
 	bool m_localAddrSet = false;
+
+	// Remote endpoint - written from UV thread, read from game thread
+	// Uses memory fence for synchronization
 	RemoteEndpoint m_remoteEndpoint;
+	std::atomic<bool> m_remoteEndpointSet{false};
 
-	mutable std::mutex m_socketMutex;
-	mutable std::mutex m_acceptorMutex;
-	mutable std::mutex m_endpointMutex;
-
+	// Receive buffer (TCP is stream-based, smaller buffer is sufficient)
 	static constexpr size_t kRecvBufferSize = 16384;
+	char m_recvBuffer[kRecvBufferSize];
 };

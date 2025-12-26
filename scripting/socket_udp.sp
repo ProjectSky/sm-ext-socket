@@ -1,3 +1,24 @@
+/**
+ * Socket UDP Example
+ *
+ * Demonstrates UDP server that receives messages and echoes them back.
+ *
+ * Commands:
+ *   sm_udpserver [port]              - Start UDP server (default port: 27021)
+ *   sm_udpsend <host> <port> <msg>   - Send UDP message to specified destination
+ *   sm_udpstop                       - Stop UDP server
+ *
+ * Usage:
+ *   1. Load the plugin
+ *   2. Run "sm_udpserver" to start listening
+ *   3. Send messages from another client: echo "hello" | nc -u 127.0.0.1 27021
+ *   4. Or use "sm_udpsend 127.0.0.1 27021 hello" from another server
+ *   5. Run "sm_udpstop" to stop the server
+ */
+
+#pragma semicolon 1
+#pragma newdecls required
+
 #include <sourcemod>
 #include <socket>
 
@@ -17,7 +38,6 @@ public void OnPluginStart() {
 	RegConsoleCmd("sm_udpstop", Command_UdpStop, "Stop UDP server");
 }
 
-// Start UDP server to receive messages
 Action Command_UdpServer(int client, int args) {
 	if (g_UdpSocket != null) {
 		ReplyToCommand(client, "[UDP] Already running");
@@ -33,9 +53,9 @@ Action Command_UdpServer(int client, int args) {
 
 	g_UdpSocket = new Socket(SOCKET_UDP);
 	g_UdpSocket.SetOption(SocketReuseAddr, 1);
-	g_UdpSocket.SetReceiveCallback(OnUdpReceive);
-	g_UdpSocket.SetListenCallback(OnUdpListenReady);
-	g_UdpSocket.SetErrorCallback(OnUdpError);
+	g_UdpSocket.SetReceiveCallback(Socket_OnReceive);
+	g_UdpSocket.SetListenCallback(Socket_OnListen);
+	g_UdpSocket.SetErrorCallback(Socket_OnError);
 
 	g_UdpSocket.Bind("0.0.0.0", port);
 	g_UdpSocket.Listen();
@@ -43,8 +63,6 @@ Action Command_UdpServer(int client, int args) {
 	return Plugin_Handled;
 }
 
-// Send UDP message: sm_udpsend <host> <port> <message>
-// Note: Uses the server socket if running, otherwise creates a temporary one
 Action Command_UdpSend(int client, int args) {
 	if (args < 3) {
 		ReplyToCommand(client, "Usage: sm_udpsend <host> <port> <message>");
@@ -58,7 +76,6 @@ Action Command_UdpSend(int client, int args) {
 
 	int port = StringToInt(portStr);
 
-	// Use existing server socket if available, otherwise create new one
 	if (g_UdpSocket != null) {
 		g_UdpSocket.SendTo(message, -1, host, port);
 		PrintToServer("[UDP] Sent via server socket to %s:%d: %s", host, port, message);
@@ -78,11 +95,11 @@ Action Command_UdpStop(int client, int args) {
 	return Plugin_Handled;
 }
 
-void OnUdpListenReady(Socket socket, const char[] localIP, int localPort, any data) {
+void Socket_OnListen(Socket socket, const char[] localIP, int localPort, any data) {
 	PrintToServer("[UDP] Listening on %s:%d", localIP, localPort);
 }
 
-static void OnUdpReceive(Socket socket, const char[] buffer, const int size, const char[] senderIP, int senderPort, any data) {
+void Socket_OnReceive(Socket socket, const char[] buffer, const int size, const char[] senderIP, int senderPort, any data) {
 	PrintToServer("[UDP] Received from %s:%d (%d bytes): %s", senderIP, senderPort, size, buffer);
 
 	// Don't echo back echo responses (prevent infinite loop)
@@ -94,12 +111,6 @@ static void OnUdpReceive(Socket socket, const char[] buffer, const int size, con
 	socket.SendTo(response, -1, senderIP, senderPort);
 }
 
-void OnUdpError(Socket socket, const int errorType, const int errorNum, any data) {
-	PrintToServer("[UDP] Error: type=%d, errno=%d", errorType, errorNum);
-}
-
-public void OnPluginEnd() {
-	if (g_UdpSocket != null) {
-		delete g_UdpSocket;
-	}
+void Socket_OnError(Socket socket, const int errorType, const char[] errorMsg, any data) {
+	PrintToServer("[UDP] Error: type=%d, message=%s", errorType, errorMsg);
 }

@@ -6,8 +6,7 @@ A complete rewrite of the [original socket extension](https://github.com/JoinedS
 
 ## Features
 * Built on [libuv](https://github.com/libuv/libuv) for high-performance async I/O
-* TCP client and server support
-* UDP send/receive with SendTo support
+* TCP/UDP/UDS client and server support
 * IPv4/IPv6 support
 * Configurable socket options (timeout, buffer size, keep-alive, etc.)
 * Connect timeout for TCP connections

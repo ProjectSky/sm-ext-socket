@@ -1,6 +1,7 @@
 #include "extension.h"
 #include "core/SocketManager.h"
 #include "core/CallbackManager.h"
+#include "socket/SocketBase.h"
 
 SocketExtension g_SocketExt;
 SMEXT_LINK(&g_SocketExt);
@@ -39,6 +40,6 @@ void SocketExtension::SDK_OnUnload() {
 
 void SocketExtension::OnHandleDestroy(HandleType_t type, void* object) {
 	if (object != nullptr) {
-		g_SocketManager.DestroySocket(static_cast<SocketWrapper*>(object));
+		g_SocketManager.DestroySocket(static_cast<SocketBase*>(object));
 	}
 }

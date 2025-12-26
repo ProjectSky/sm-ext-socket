@@ -1,3 +1,20 @@
+/**
+ * Socket TCP Client Example
+ *
+ * Demonstrates basic TCP client connection to a remote server.
+ *
+ * Commands:
+ *   sm_tcptest - Connect to example.com:80 and send HTTP GET request
+ *
+ * Usage:
+ *   1. Load the plugin
+ *   2. Run "sm_tcptest" in server console
+ *   3. Watch console for connection status and response
+ */
+
+#pragma semicolon 1
+#pragma newdecls required
+
 #include <sourcemod>
 #include <socket>
 
@@ -21,10 +38,10 @@ Action Command_TcpTest(int client, int args) {
 	}
 
 	g_Socket = new Socket();
-	g_Socket.SetConnectCallback(OnSocketConnect);
-	g_Socket.SetReceiveCallback(OnSocketReceive);
-	g_Socket.SetDisconnectCallback(OnSocketDisconnect);
-	g_Socket.SetErrorCallback(OnSocketError);
+	g_Socket.SetConnectCallback(Socket_OnConnect);
+	g_Socket.SetReceiveCallback(Socket_OnReceive);
+	g_Socket.SetDisconnectCallback(Socket_OnDisconnect);
+	g_Socket.SetErrorCallback(Socket_OnError);
 
 	// Connect to example.com on port 80
 	g_Socket.Connect("example.com", 80);
@@ -33,7 +50,7 @@ Action Command_TcpTest(int client, int args) {
 	return Plugin_Handled;
 }
 
-static void OnSocketConnect(Socket socket, any data) {
+void Socket_OnConnect(Socket socket, any data) {
 	PrintToServer("[TCP] Connected!");
 
 	// Send HTTP GET request
@@ -48,7 +65,7 @@ static void OnSocketConnect(Socket socket, any data) {
 	PrintToServer("[TCP] Request sent");
 }
 
-static void OnSocketReceive(Socket socket, const char[] buffer, const int size, const char[] senderIP, int senderPort, any data) {
+void Socket_OnReceive(Socket socket, const char[] buffer, const int size, const char[] senderIP, int senderPort, any data) {
 	PrintToServer("[TCP] Received %d bytes:", size);
 	// Print first 200 chars to avoid flooding console
 	char preview[201];
@@ -56,14 +73,14 @@ static void OnSocketReceive(Socket socket, const char[] buffer, const int size, 
 	PrintToServer("%s", preview);
 }
 
-static void OnSocketDisconnect(Socket socket, any data) {
+void Socket_OnDisconnect(Socket socket, any data) {
 	PrintToServer("[TCP] Disconnected");
 	delete g_Socket;
 	g_Socket = null;
 }
 
-static void OnSocketError(Socket socket, const int errorType, const int errorNum, any data) {
-	PrintToServer("[TCP] Error: type=%d, errno=%d", errorType, errorNum);
+void Socket_OnError(Socket socket, const int errorType, const char[] errorMsg, any data) {
+	PrintToServer("[TCP] Error: type=%d, message=%s", errorType, errorMsg);
 	delete g_Socket;
 	g_Socket = null;
 }

@@ -1,64 +1,59 @@
 #pragma once
 
 #include "socket/SocketTypes.h"
-#include <deque>
-#include <mutex>
-#include <memory>
-#include <string>
-#include <variant>
+#include "lockfree/SPSCQueue.h"
+#include "lockfree/QueueTypes.h"
+#include <atomic>
 
 class SocketBase;
-struct SocketWrapper;
 
-struct CallbackPayload {
-	std::string receiveData;
-	RemoteEndpoint endpoint;  // Used for sender/remote/local depending on event
-	SocketBase* newSocket = nullptr;
-
-	SocketError errorType = SocketError::None;
-	int errorCode = 0;
-};
-
-class QueuedCallback {
-public:
-	QueuedCallback(CallbackEvent event, SocketBase* socket);
-	QueuedCallback(CallbackEvent event, SocketBase* socket, const RemoteEndpoint& localEndpoint);
-	QueuedCallback(CallbackEvent event, SocketBase* socket, const char* data, size_t length);
-	QueuedCallback(CallbackEvent event, SocketBase* socket, const char* data, size_t length, const RemoteEndpoint& sender);
-	QueuedCallback(CallbackEvent event, SocketBase* socket, SocketBase* newSocket, const RemoteEndpoint& endpoint);
-	QueuedCallback(CallbackEvent event, SocketBase* socket, SocketError errorType, int errorCode);
-	~QueuedCallback() = default;
-
-	[[nodiscard]] bool IsExecutable() const;
-	[[nodiscard]] bool IsValid() const;
-	void Execute();
-	[[nodiscard]] CallbackEvent GetEvent() const { return m_event; }
-	[[nodiscard]] SocketWrapper* GetSocketWrapper() const { return m_socketWrapper; }
-
-private:
-	void ExecuteImpl();
-
-	CallbackEvent m_event;
-	SocketWrapper* m_socketWrapper = nullptr;
-	CallbackPayload m_payload;
-};
-
+/**
+ * Lock-free callback manager using SPSC queues.
+ *
+ * Thread model:
+ * - UV thread: produces events via EnqueueXxx() methods
+ * - Game thread: consumes events via ProcessPendingCallbacks()
+ *
+ * Each event type has its own queue to avoid the need for variant types
+ * and to allow type-safe processing.
+ */
 class CallbackManager {
 public:
-	void Enqueue(std::unique_ptr<QueuedCallback> callback);
-	void Enqueue(CallbackEvent event, SocketBase* socket);
-	void Enqueue(CallbackEvent event, SocketBase* socket, const RemoteEndpoint& localEndpoint);
-	void Enqueue(CallbackEvent event, SocketBase* socket, const char* data, size_t length);
-	void Enqueue(CallbackEvent event, SocketBase* socket, const char* data, size_t length, const RemoteEndpoint& sender);
-	void Enqueue(CallbackEvent event, SocketBase* socket, SocketBase* newSocket);
-	void Enqueue(CallbackEvent event, SocketBase* socket, SocketError errorType, int errorCode);
-	void RemoveByWrapper(SocketWrapper* wrapper);
+	// Enqueue methods (called from UV thread)
+	void EnqueueConnect(SocketBase* socket, const RemoteEndpoint& endpoint);
+	void EnqueueDisconnect(SocketBase* socket);
+	void EnqueueListen(SocketBase* socket, const RemoteEndpoint& localEndpoint);
+	void EnqueueIncoming(SocketBase* socket, SocketBase* newSocket, const RemoteEndpoint& remoteEndpoint);
+	void EnqueueReceive(SocketBase* socket, const char* data, size_t length);
+	void EnqueueReceive(SocketBase* socket, const char* data, size_t length, const RemoteEndpoint& sender);
+	void EnqueueError(SocketBase* socket, SocketError errorType, const char* errorMsg);
+
+	// Process callbacks (called from game thread)
 	void ProcessPendingCallbacks();
 
+	// Check if there are pending callbacks for a socket
+	[[nodiscard]] bool HasPendingCallbacks() const;
+
 private:
-	std::unique_ptr<QueuedCallback> DequeueNext();
-	std::deque<std::unique_ptr<QueuedCallback>> m_queue;
-	std::mutex m_queueMutex;
+	// Execute individual callback types
+	void ExecuteConnect(const QueuedConnectEvent& event);
+	void ExecuteDisconnect(const QueuedDisconnectEvent& event);
+	void ExecuteListen(const QueuedListenEvent& event);
+	void ExecuteIncoming(const QueuedIncomingEvent& event);
+	void ExecuteReceive(const QueuedDataEvent& event);
+	void ExecuteError(const QueuedErrorEvent& event);
+
+	// Helper to check if socket is valid for callback execution
+	[[nodiscard]] bool IsSocketValid(SocketBase* socket) const;
+
+	// SPSC queues for each event type
+	// UV thread produces, game thread consumes
+	SPSCQueue<QueuedConnectEvent, 256> m_connectQueue;
+	SPSCQueue<QueuedDisconnectEvent, 256> m_disconnectQueue;
+	SPSCQueue<QueuedListenEvent, 64> m_listenQueue;
+	SPSCQueue<QueuedIncomingEvent, 256> m_incomingQueue;
+	SPSCQueue<QueuedDataEvent, 1024> m_dataQueue;
+	SPSCQueue<QueuedErrorEvent, 256> m_errorQueue;
 };
 
 extern CallbackManager g_CallbackManager;

@@ -1,3 +1,23 @@
+/**
+ * Socket TCP Server Example
+ *
+ * Demonstrates TCP echo server that accepts multiple client connections.
+ *
+ * Commands:
+ *   sm_tcpserver [port] - Start TCP echo server (default port: 27020)
+ *   sm_tcpstop          - Stop TCP server and disconnect all clients
+ *
+ * Usage:
+ *   1. Load the plugin
+ *   2. Run "sm_tcpserver" or "sm_tcpserver 12345" to start on custom port
+ *   3. Connect with telnet/netcat: telnet localhost 27020
+ *   4. Send messages and receive echoes
+ *   5. Run "sm_tcpstop" to stop the server
+ */
+
+#pragma semicolon 1
+#pragma newdecls required
+
 #include <sourcemod>
 #include <socket>
 
@@ -33,9 +53,9 @@ Action Command_TcpServer(int client, int args) {
 
 	g_ServerSocket = new Socket();
 	g_ServerSocket.SetOption(SocketReuseAddr, 1);
-	g_ServerSocket.SetIncomingCallback(OnClientConn);
-	g_ServerSocket.SetListenCallback(OnListenReady);
-	g_ServerSocket.SetErrorCallback(OnServerError);
+	g_ServerSocket.SetIncomingCallback(Socket_OnIncoming);
+	g_ServerSocket.SetListenCallback(Socket_OnListen);
+	g_ServerSocket.SetErrorCallback(Socket_OnServerError);
 
 	g_ServerSocket.Bind("0.0.0.0", port);
 	g_ServerSocket.Listen();
@@ -66,16 +86,16 @@ void StopServer() {
 	}
 }
 
-void OnListenReady(Socket socket, const char[] localIP, int localPort, any data) {
+void Socket_OnListen(Socket socket, const char[] localIP, int localPort, any data) {
 	PrintToServer("[TCP Server] Listening on %s:%d", localIP, localPort);
 }
 
-void OnClientConn(Socket socket, Socket newSocket, const char[] remoteIP, int remotePort, any data) {
+void Socket_OnIncoming(Socket socket, Socket newSocket, const char[] remoteIP, int remotePort, any data) {
 	PrintToServer("[TCP Server] Client connected: %s:%d", remoteIP, remotePort);
 
-	newSocket.SetReceiveCallback(OnClientReceive);
-	newSocket.SetDisconnectCallback(OnClientDisconn);
-	newSocket.SetErrorCallback(OnClientError);
+	newSocket.SetReceiveCallback(Socket_OnClientReceive);
+	newSocket.SetDisconnectCallback(Socket_OnClientDisconnect);
+	newSocket.SetErrorCallback(Socket_OnClientError);
 
 	g_Clients.Push(newSocket);
 
@@ -83,7 +103,7 @@ void OnClientConn(Socket socket, Socket newSocket, const char[] remoteIP, int re
 	newSocket.Send("Welcome to the echo server!\n");
 }
 
-void OnClientReceive(Socket socket, const char[] buffer, const int size, const char[] senderIP, int senderPort, any data) {
+void Socket_OnClientReceive(Socket socket, const char[] buffer, const int size, const char[] senderIP, int senderPort, any data) {
 	PrintToServer("[TCP Server] Received from client: %s", buffer);
 
 	// Echo back
@@ -92,18 +112,18 @@ void OnClientReceive(Socket socket, const char[] buffer, const int size, const c
 	socket.Send(response);
 }
 
-void OnClientDisconn(Socket socket, any data) {
+void Socket_OnClientDisconnect(Socket socket, any data) {
 	PrintToServer("[TCP Server] Client disconnected");
 	RemoveClient(socket);
 }
 
-void OnClientError(Socket socket, const int errorType, const int errorNum, any data) {
-	PrintToServer("[TCP Server] Client error: type=%d, errno=%d", errorType, errorNum);
+void Socket_OnClientError(Socket socket, const int errorType, const char[] errorMsg, any data) {
+	PrintToServer("[TCP Server] Client error: type=%d, message=%s", errorType, errorMsg);
 	RemoveClient(socket);
 }
 
-void OnServerError(Socket socket, const int errorType, const int errorNum, any data) {
-	PrintToServer("[TCP Server] Server error: type=%d, errno=%d", errorType, errorNum);
+void Socket_OnServerError(Socket socket, const int errorType, const char[] errorMsg, any data) {
+	PrintToServer("[TCP Server] Server error: type=%d, message=%s", errorType, errorMsg);
 	StopServer();
 }
 
@@ -113,9 +133,4 @@ void RemoveClient(Socket socket) {
 		g_Clients.Erase(index);
 	}
 	delete socket;
-}
-
-public void OnPluginEnd() {
-	StopServer();
-	delete g_Clients;
 }

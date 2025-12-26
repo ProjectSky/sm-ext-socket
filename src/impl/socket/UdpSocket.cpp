@@ -2,8 +2,7 @@
 #include "core/EventLoop.h"
 #include "core/CallbackManager.h"
 #include <cstring>
-
-using SharedLock = std::shared_lock<std::shared_mutex>;
+#include <atomic>
 
 struct UdpSendContext {
 	uv_udp_send_t sendRequest;
@@ -11,67 +10,53 @@ struct UdpSendContext {
 	std::unique_ptr<char[]> buffer;
 	size_t length;
 	UdpSocket* socket;
-	std::unique_ptr<SharedLock> handlerLock;
 };
 
 UdpSocket::UdpSocket() : SocketBase(SocketType::Udp) {}
 
 UdpSocket::~UdpSocket() {
 	Disconnect();
-
-	std::unique_lock<std::shared_mutex> lock(m_handlerMutex);
 }
 
 void UdpSocket::InitSocket(int addressFamily) {
-	if (m_socket) return;
+	uv_udp_t* expected = nullptr;
+	uv_udp_t* newSocket = new uv_udp_t;
+	uv_udp_init(g_EventLoop.GetLoop(), newSocket);
+	newSocket->data = this;
 
-	std::scoped_lock lock(m_socketMutex);
-	if (m_socket) return;
-
-	m_socket = new uv_udp_t;
-	uv_udp_init(g_EventLoop.GetLoop(), m_socket);
-	m_socket->data = this;
+	if (!m_socket.compare_exchange_strong(expected, newSocket,
+		std::memory_order_release, std::memory_order_acquire)) {
+		// Another thread already initialized the socket
+		uv_close(reinterpret_cast<uv_handle_t*>(newSocket), OnClose);
+		return;
+	}
 
 	int result = 0;
 	if (m_localAddrSet) {
-		result = uv_udp_bind(m_socket, reinterpret_cast<const sockaddr*>(&m_localAddr), 0);
+		result = uv_udp_bind(newSocket, reinterpret_cast<const sockaddr*>(&m_localAddr), 0);
 	} else if (addressFamily == AF_INET6) {
 		sockaddr_in6 anyAddress{};
 		anyAddress.sin6_family = AF_INET6;
 		anyAddress.sin6_addr = in6addr_any;
 		anyAddress.sin6_port = 0;
-		result = uv_udp_bind(m_socket, reinterpret_cast<const sockaddr*>(&anyAddress), 0);
+		result = uv_udp_bind(newSocket, reinterpret_cast<const sockaddr*>(&anyAddress), 0);
 	} else {
 		sockaddr_in anyAddress{};
 		anyAddress.sin_family = AF_INET;
 		anyAddress.sin_addr.s_addr = INADDR_ANY;
 		anyAddress.sin_port = 0;
-		result = uv_udp_bind(m_socket, reinterpret_cast<const sockaddr*>(&anyAddress), 0);
+		result = uv_udp_bind(newSocket, reinterpret_cast<const sockaddr*>(&anyAddress), 0);
 	}
 
 	if (result != 0) {
-		g_CallbackManager.Enqueue(CallbackEvent::Error, this, SocketError::BindError, result);
+		g_CallbackManager.EnqueueError(this, SocketError::BindError, uv_strerror(result));
 	}
 
-	ApplyPendingOptions();
-}
-
-void UdpSocket::ApplyPendingOptions() {
-	std::scoped_lock optionsLock(m_optionsMutex);
-
-	uv_os_sock_t socketFd;
-	if (m_socket && uv_fileno(reinterpret_cast<uv_handle_t*>(m_socket), reinterpret_cast<uv_os_fd_t*>(&socketFd)) == 0) {
-		while (!m_pendingOptions.empty()) {
-			auto& option = m_pendingOptions.front();
-			SetSocketOption(socketFd, option.option, option.value);
-			m_pendingOptions.pop();
-		}
-	}
+	ApplyPendingOptions(reinterpret_cast<uv_handle_t*>(newSocket));
 }
 
 bool UdpSocket::IsOpen() const {
-	std::scoped_lock lock(m_socketMutex);
-	return m_socket != nullptr;
+	return m_socket.load(std::memory_order_acquire) != nullptr;
 }
 
 bool UdpSocket::Bind(const char* hostname, uint16_t port, bool async) {
@@ -95,13 +80,18 @@ bool UdpSocket::Bind(const char* hostname, uint16_t port, bool async) {
 			[](uv_getaddrinfo_t* request, int status, struct addrinfo* addressInfo) {
 				auto* socket = static_cast<UdpSocket*>(request->data);
 
+				if (socket->IsDeleted()) {
+					if (addressInfo) uv_freeaddrinfo(addressInfo);
+					delete request;
+					return;
+				}
+
 				if (status == 0 && addressInfo) {
 					std::memcpy(&socket->m_localAddr, addressInfo->ai_addr, addressInfo->ai_addrlen);
 					socket->m_localAddrSet = true;
 					uv_freeaddrinfo(addressInfo);
 				} else {
-					g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-						SocketError::BindError, status);
+					g_CallbackManager.EnqueueError(socket, SocketError::BindError, uv_strerror(status));
 				}
 
 				delete request;
@@ -143,20 +133,26 @@ bool UdpSocket::Connect(const char* hostname, uint16_t port, bool async) {
 		[](uv_getaddrinfo_t* request, int status, struct addrinfo* addressInfo) {
 			auto* socket = static_cast<UdpSocket*>(request->data);
 
+			if (socket->IsDeleted()) {
+				if (addressInfo) uv_freeaddrinfo(addressInfo);
+				delete request;
+				return;
+			}
+
 			if (status == 0 && addressInfo) {
-				if (!socket->m_socket) {
+				if (socket->m_socket.load(std::memory_order_acquire) == nullptr) {
 					socket->InitSocket(addressInfo->ai_family);
 				}
 
 				std::memcpy(&socket->m_connectedAddr, addressInfo->ai_addr, addressInfo->ai_addrlen);
-				socket->m_isConnected = true;
+				socket->m_isConnected.store(true, std::memory_order_release);
 				uv_freeaddrinfo(addressInfo);
 
-				g_CallbackManager.Enqueue(CallbackEvent::Connect, socket);
+				RemoteEndpoint endpoint;
+				g_CallbackManager.EnqueueConnect(socket, endpoint);
 				socket->StartReceiving();
 			} else {
-				g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-					SocketError::ConnectError, status);
+				g_CallbackManager.EnqueueError(socket, SocketError::ConnectError, uv_strerror(status));
 			}
 
 			delete request;
@@ -172,17 +168,8 @@ bool UdpSocket::Connect(const char* hostname, uint16_t port, bool async) {
 }
 
 bool UdpSocket::Disconnect() {
-	uv_udp_t* socketToClose = nullptr;
-
-	{
-		std::scoped_lock lock(m_socketMutex);
-		if (m_socket) {
-			socketToClose = m_socket;
-			m_socket = nullptr;
-		}
-	}
-
-	m_isConnected = false;
+	uv_udp_t* socketToClose = m_socket.exchange(nullptr, std::memory_order_acq_rel);
+	m_isConnected.store(false, std::memory_order_release);
 
 	if (socketToClose) {
 		g_EventLoop.Post([socketToClose]() {
@@ -196,24 +183,31 @@ bool UdpSocket::Disconnect() {
 	return true;
 }
 
+bool UdpSocket::CloseReset() {
+	// UDP doesn't have RST, just do normal disconnect
+	return Disconnect();
+}
+
 bool UdpSocket::Listen() {
 	if (!m_localAddrSet) {
 		return false;
 	}
 
 	g_EventLoop.Post([this]() {
-		if (!m_socket) {
+		if (IsDeleted()) return;
+
+		if (m_socket.load(std::memory_order_acquire) == nullptr) {
 			InitSocket();
 		}
 		StartReceiving();
-		g_CallbackManager.Enqueue(CallbackEvent::Listen, this, GetLocalEndpoint());
+		g_CallbackManager.EnqueueListen(this, GetLocalEndpoint());
 	});
 
 	return true;
 }
 
 bool UdpSocket::Send(std::string_view data, bool async) {
-	if (!m_isConnected) {
+	if (!m_isConnected.load(std::memory_order_acquire)) {
 		return false;
 	}
 
@@ -235,7 +229,6 @@ bool UdpSocket::SendTo(std::string_view data, const char* hostname, uint16_t por
 		std::memcpy(context->buffer.get(), data.data(), data.length());
 		context->length = data.length();
 		context->socket = this;
-		context->handlerLock = std::make_unique<SharedLock>(m_handlerMutex);
 		context->resolverRequest.data = context;
 
 		int result = uv_getaddrinfo(g_EventLoop.GetLoop(), &context->resolverRequest,
@@ -243,20 +236,25 @@ bool UdpSocket::SendTo(std::string_view data, const char* hostname, uint16_t por
 				auto* context = static_cast<UdpSendContext*>(resolverRequest->data);
 				auto* socket = context->socket;
 
-				if (status != 0 || !addressInfo) {
-					g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-						SocketError::NoHost, status);
+				if (socket->IsDeleted()) {
 					delete context;
 					if (addressInfo) uv_freeaddrinfo(addressInfo);
 					return;
 				}
 
-				if (!socket->m_socket) {
+				if (status != 0 || !addressInfo) {
+					g_CallbackManager.EnqueueError(socket, SocketError::NoHost, uv_strerror(status));
+					delete context;
+					if (addressInfo) uv_freeaddrinfo(addressInfo);
+					return;
+				}
+
+				if (socket->m_socket.load(std::memory_order_acquire) == nullptr) {
 					socket->InitSocket(addressInfo->ai_family);
 				}
 
-				std::scoped_lock lock(socket->m_socketMutex);
-				if (!socket->m_socket) {
+				uv_udp_t* udpSocket = socket->m_socket.load(std::memory_order_acquire);
+				if (!udpSocket) {
 					delete context;
 					uv_freeaddrinfo(addressInfo);
 					return;
@@ -265,12 +263,11 @@ bool UdpSocket::SendTo(std::string_view data, const char* hostname, uint16_t por
 				context->sendRequest.data = context;
 				uv_buf_t uvBuffer = uv_buf_init(context->buffer.get(), static_cast<unsigned int>(context->length));
 
-				int sendResult = uv_udp_send(&context->sendRequest, socket->m_socket, &uvBuffer, 1, addressInfo->ai_addr, OnSend);
+				int sendResult = uv_udp_send(&context->sendRequest, udpSocket, &uvBuffer, 1, addressInfo->ai_addr, OnSend);
 				uv_freeaddrinfo(addressInfo);
 
 				if (sendResult != 0) {
-					g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-						SocketError::SendError, sendResult);
+					g_CallbackManager.EnqueueError(socket, SocketError::SendError, uv_strerror(sendResult));
 					delete context;
 				}
 			},
@@ -282,28 +279,32 @@ bool UdpSocket::SendTo(std::string_view data, const char* hostname, uint16_t por
 		}
 
 		return true;
-	} else if (m_isConnected) {
+	} else if (m_isConnected.load(std::memory_order_acquire)) {
 		auto* context = new UdpSendContext;
 		context->buffer = std::make_unique<char[]>(data.length());
 		std::memcpy(context->buffer.get(), data.data(), data.length());
 		context->length = data.length();
 		context->socket = this;
-		context->handlerLock = std::make_unique<SharedLock>(m_handlerMutex);
 		context->sendRequest.data = context;
 
 		g_EventLoop.Post([this, context]() {
-			std::scoped_lock lock(m_socketMutex);
-			if (!m_socket) {
+			if (IsDeleted()) {
+				delete context;
+				return;
+			}
+
+			uv_udp_t* socket = m_socket.load(std::memory_order_acquire);
+			if (!socket) {
 				delete context;
 				return;
 			}
 
 			uv_buf_t uvBuffer = uv_buf_init(context->buffer.get(), static_cast<unsigned int>(context->length));
 			const sockaddr* destinationAddress = reinterpret_cast<const sockaddr*>(&m_connectedAddr);
-			int result = uv_udp_send(&context->sendRequest, m_socket, &uvBuffer, 1, destinationAddress, OnSend);
+			int result = uv_udp_send(&context->sendRequest, socket, &uvBuffer, 1, destinationAddress, OnSend);
 
 			if (result != 0) {
-				g_CallbackManager.Enqueue(CallbackEvent::Error, this, SocketError::SendError, result);
+				g_CallbackManager.EnqueueError(this, SocketError::SendError, uv_strerror(result));
 				delete context;
 			}
 		});
@@ -318,23 +319,23 @@ void UdpSocket::OnSend(uv_udp_send_t* request, int status) {
 	auto* context = static_cast<UdpSendContext*>(request->data);
 	auto* socket = context->socket;
 
-	if (status != 0 && status != UV_ECANCELED) {
-		g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-			SocketError::SendError, status);
+	if (!socket->IsDeleted() && status != 0 && status != UV_ECANCELED) {
+		g_CallbackManager.EnqueueError(socket, SocketError::SendError, uv_strerror(status));
 	}
 
 	delete context;
 }
 
 void UdpSocket::StartReceiving() {
-	std::scoped_lock lock(m_socketMutex);
-	if (!m_socket) return;
+	uv_udp_t* socket = m_socket.load(std::memory_order_acquire);
+	if (!socket) return;
 
-	uv_udp_recv_start(m_socket, OnAllocBuffer, OnRecv);
+	uv_udp_recv_start(socket, OnAllocBuffer, OnRecv);
 }
 
 void UdpSocket::OnAllocBuffer(uv_handle_t* handle, size_t suggestedSize, uv_buf_t* buffer) {
-	buffer->base = new char[kRecvBufferSize];
+	auto* socket = static_cast<UdpSocket*>(handle->data);
+	buffer->base = socket->m_recvBuffer;
 	buffer->len = kRecvBufferSize;
 }
 
@@ -342,33 +343,34 @@ void UdpSocket::OnRecv(uv_udp_t* handle, ssize_t bytesRead, const uv_buf_t* buff
 					   const struct sockaddr* senderAddress, unsigned flags) {
 	auto* socket = static_cast<UdpSocket*>(handle->data);
 
-	if (bytesRead > 0) {
-		RemoteEndpoint sender = ExtractEndpoint(senderAddress);
-		g_CallbackManager.Enqueue(CallbackEvent::Receive, socket, buffer->base, bytesRead, sender);
-	} else if (bytesRead < 0) {
-		if (bytesRead == UV_EOF) {
-			g_CallbackManager.Enqueue(CallbackEvent::Disconnect, socket);
-		} else if (bytesRead != UV_ECANCELED) {
-			g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-				SocketError::RecvError, static_cast<int>(bytesRead));
-		}
+	if (socket->IsDeleted()) {
+		return;
 	}
 
-	delete[] buffer->base;
+	if (bytesRead > 0) {
+		RemoteEndpoint sender = ExtractEndpoint(senderAddress);
+		g_CallbackManager.EnqueueReceive(socket, buffer->base, bytesRead, sender);
+	} else if (bytesRead < 0) {
+		if (bytesRead == UV_EOF) {
+			g_CallbackManager.EnqueueDisconnect(socket);
+		} else if (bytesRead != UV_ECANCELED) {
+			g_CallbackManager.EnqueueError(socket, SocketError::RecvError, uv_strerror(static_cast<int>(bytesRead)));
+		}
+	}
 }
 
 bool UdpSocket::SetOption(SocketOption option, int value) {
-	if (option == SocketOption::AutoClose) {
-		std::scoped_lock lock(m_optionsMutex);
-		m_options[option] = value;
+	// Store in atomic array for immediate reads
+	StoreOption(option, value);
+
+	if (option == SocketOption::AutoFreeHandle) {
 		return true;
 	}
 
-	std::scoped_lock lock(m_socketMutex);
-
-	if (m_socket) {
+	uv_udp_t* socket = m_socket.load(std::memory_order_acquire);
+	if (socket) {
 		uv_os_sock_t socketFd;
-		if (uv_fileno(reinterpret_cast<uv_handle_t*>(m_socket), reinterpret_cast<uv_os_fd_t*>(&socketFd)) == 0) {
+		if (uv_fileno(reinterpret_cast<uv_handle_t*>(socket), reinterpret_cast<uv_os_fd_t*>(&socketFd)) == 0) {
 			return SetSocketOption(socketFd, option, value);
 		}
 	}
@@ -378,12 +380,12 @@ bool UdpSocket::SetOption(SocketOption option, int value) {
 }
 
 RemoteEndpoint UdpSocket::GetLocalEndpoint() const {
-	std::scoped_lock lock(m_socketMutex);
-	if (!m_socket) return {};
+	uv_udp_t* socket = m_socket.load(std::memory_order_acquire);
+	if (!socket) return {};
 
 	sockaddr_storage addr;
 	int addrLen = sizeof(addr);
-	if (uv_udp_getsockname(m_socket, reinterpret_cast<sockaddr*>(&addr), &addrLen) != 0) {
+	if (uv_udp_getsockname(socket, reinterpret_cast<sockaddr*>(&addr), &addrLen) != 0) {
 		return {};
 	}
 	return ExtractEndpoint(reinterpret_cast<sockaddr*>(&addr));

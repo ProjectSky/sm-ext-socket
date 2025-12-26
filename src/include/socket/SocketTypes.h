@@ -18,12 +18,13 @@
 class SocketBase;
 class TcpSocket;
 class UdpSocket;
+class UnixSocket;
 class EventLoop;
-struct SocketWrapper;
 
 enum class SocketType {
 	Tcp = 1,
-	Udp = 2
+	Udp = 2,
+	Unix = 3
 };
 
 enum class SocketError {
@@ -58,7 +59,7 @@ enum class SocketOption {
 	// Extension options
 	DebugMode = 16,
 	ConnectTimeout = 17,
-	AutoClose = 18
+	AutoFreeHandle = 18
 };
 
 enum class CallbackEvent {

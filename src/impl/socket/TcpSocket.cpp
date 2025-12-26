@@ -3,14 +3,12 @@
 #include "core/CallbackManager.h"
 #include "core/SocketManager.h"
 #include <cstring>
-
-using SharedLock = std::shared_lock<std::shared_mutex>;
+#include <atomic>
 
 struct TcpConnectContext {
 	uv_connect_t connectRequest;
 	uv_getaddrinfo_t resolverRequest;
 	TcpSocket* socket;
-	std::unique_ptr<SharedLock> handlerLock;
 };
 
 struct TcpWriteContext {
@@ -18,50 +16,37 @@ struct TcpWriteContext {
 	std::unique_ptr<char[]> buffer;
 	size_t length;
 	TcpSocket* socket;
-	std::unique_ptr<SharedLock> handlerLock;
 };
 
 TcpSocket::TcpSocket() : SocketBase(SocketType::Tcp) {}
 
 TcpSocket::~TcpSocket() {
 	Disconnect();
-
-	std::unique_lock<std::shared_mutex> lock(m_handlerMutex);
 }
 
 void TcpSocket::InitSocket() {
-	if (m_socket) return;
+	uv_tcp_t* expected = nullptr;
+	uv_tcp_t* newSocket = new uv_tcp_t;
+	uv_tcp_init(g_EventLoop.GetLoop(), newSocket);
+	newSocket->data = this;
 
-	std::scoped_lock lock(m_socketMutex);
-	if (m_socket) return;
-
-	m_socket = new uv_tcp_t;
-	uv_tcp_init(g_EventLoop.GetLoop(), m_socket);
-	m_socket->data = this;
+	if (!m_socket.compare_exchange_strong(expected, newSocket,
+		std::memory_order_release, std::memory_order_acquire)) {
+		// Another thread already initialized the socket
+		uv_close(reinterpret_cast<uv_handle_t*>(newSocket), OnClose);
+		return;
+	}
 
 	if (m_localAddrSet) {
-		uv_tcp_bind(m_socket, reinterpret_cast<const sockaddr*>(&m_localAddr), 0);
+		uv_tcp_bind(newSocket, reinterpret_cast<const sockaddr*>(&m_localAddr), 0);
 	}
 
-	ApplyPendingOptions();
-}
-
-void TcpSocket::ApplyPendingOptions() {
-	std::scoped_lock optionsLock(m_optionsMutex);
-
-	uv_os_sock_t socketFd;
-	if (m_socket && uv_fileno(reinterpret_cast<uv_handle_t*>(m_socket), reinterpret_cast<uv_os_fd_t*>(&socketFd)) == 0) {
-		while (!m_pendingOptions.empty()) {
-			auto& option = m_pendingOptions.front();
-			SetSocketOption(socketFd, option.option, option.value);
-			m_pendingOptions.pop();
-		}
-	}
+	ApplyPendingOptions(reinterpret_cast<uv_handle_t*>(newSocket));
 }
 
 bool TcpSocket::IsOpen() const {
-	std::scoped_lock lock(m_socketMutex);
-	return m_socket != nullptr && uv_is_active(reinterpret_cast<uv_handle_t*>(m_socket));
+	uv_tcp_t* socket = m_socket.load(std::memory_order_acquire);
+	return socket != nullptr && uv_is_active(reinterpret_cast<uv_handle_t*>(socket));
 }
 
 bool TcpSocket::Bind(const char* hostname, uint16_t port, bool async) {
@@ -85,13 +70,18 @@ bool TcpSocket::Bind(const char* hostname, uint16_t port, bool async) {
 			[](uv_getaddrinfo_t* request, int status, struct addrinfo* addressInfo) {
 				auto* socket = static_cast<TcpSocket*>(request->data);
 
+				if (socket->IsDeleted()) {
+					if (addressInfo) uv_freeaddrinfo(addressInfo);
+					delete request;
+					return;
+				}
+
 				if (status == 0 && addressInfo) {
 					std::memcpy(&socket->m_localAddr, addressInfo->ai_addr, addressInfo->ai_addrlen);
 					socket->m_localAddrSet = true;
 					uv_freeaddrinfo(addressInfo);
 				} else {
-					g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-						SocketError::BindError, status);
+					g_CallbackManager.EnqueueError(socket, SocketError::BindError, uv_strerror(status));
 				}
 
 				delete request;
@@ -128,7 +118,6 @@ bool TcpSocket::Connect(const char* hostname, uint16_t port, bool async) {
 
 	auto* context = new TcpConnectContext;
 	context->socket = this;
-	context->handlerLock = std::make_unique<SharedLock>(m_handlerMutex);
 	context->resolverRequest.data = context;
 
 	int result = uv_getaddrinfo(g_EventLoop.GetLoop(), &context->resolverRequest, OnResolved,
@@ -146,40 +135,44 @@ void TcpSocket::OnResolved(uv_getaddrinfo_t* request, int status, struct addrinf
 	auto* context = static_cast<TcpConnectContext*>(request->data);
 	auto* socket = context->socket;
 
-	if (status != 0 || !addressInfo) {
-		g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-			SocketError::ConnectError, status);
+	if (socket->IsDeleted()) {
 		delete context;
 		if (addressInfo) uv_freeaddrinfo(addressInfo);
 		return;
 	}
 
-	if (!socket->m_socket) {
+	if (status != 0 || !addressInfo) {
+		g_CallbackManager.EnqueueError(socket, SocketError::ConnectError, uv_strerror(status));
+		delete context;
+		if (addressInfo) uv_freeaddrinfo(addressInfo);
+		return;
+	}
+
+	if (socket->m_socket.load(std::memory_order_acquire) == nullptr) {
 		socket->InitSocket();
 	}
 
 	if (addressInfo->ai_family == AF_INET || addressInfo->ai_family == AF_INET6) {
-		std::scoped_lock endpointLock(socket->m_endpointMutex);
 		socket->m_remoteEndpoint = ExtractEndpoint(addressInfo->ai_addr);
+		std::atomic_thread_fence(std::memory_order_release);
+		socket->m_remoteEndpointSet.store(true, std::memory_order_release);
 	}
 
 	context->connectRequest.data = context;
 
-	std::scoped_lock lock(socket->m_socketMutex);
-	if (!socket->m_socket) {
-		g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-			SocketError::ConnectError, UV_ECANCELED);
+	uv_tcp_t* tcpSocket = socket->m_socket.load(std::memory_order_acquire);
+	if (!tcpSocket) {
+		g_CallbackManager.EnqueueError(socket, SocketError::ConnectError, "Socket was closed");
 		delete context;
 		uv_freeaddrinfo(addressInfo);
 		return;
 	}
 
-	int result = uv_tcp_connect(&context->connectRequest, socket->m_socket, addressInfo->ai_addr, OnConnect);
+	int result = uv_tcp_connect(&context->connectRequest, tcpSocket, addressInfo->ai_addr, OnConnect);
 	uv_freeaddrinfo(addressInfo);
 
 	if (result != 0) {
-		g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-			SocketError::ConnectError, result);
+		g_CallbackManager.EnqueueError(socket, SocketError::ConnectError, uv_strerror(result));
 		delete context;
 		return;
 	}
@@ -199,36 +192,29 @@ void TcpSocket::OnConnect(uv_connect_t* request, int status) {
 
 	socket->CancelConnectTimeout();
 
+	if (socket->IsDeleted()) {
+		delete context;
+		return;
+	}
+
 	if (status == 0) {
-		g_CallbackManager.Enqueue(CallbackEvent::Connect, socket);
+		RemoteEndpoint endpoint;
+		if (socket->m_remoteEndpointSet.load(std::memory_order_acquire)) {
+			std::atomic_thread_fence(std::memory_order_acquire);
+			endpoint = socket->m_remoteEndpoint;
+		}
+		g_CallbackManager.EnqueueConnect(socket, endpoint);
 		socket->StartReceiving();
 	} else if (status != UV_ECANCELED) {
-		g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-			SocketError::ConnectError, status);
+		g_CallbackManager.EnqueueError(socket, SocketError::ConnectError, uv_strerror(status));
 	}
 
 	delete context;
 }
 
 bool TcpSocket::Disconnect() {
-	uv_tcp_t* socketToClose = nullptr;
-	uv_tcp_t* acceptorToClose = nullptr;
-
-	{
-		std::scoped_lock lock(m_socketMutex);
-		if (m_socket) {
-			socketToClose = m_socket;
-			m_socket = nullptr;
-		}
-	}
-
-	{
-		std::scoped_lock lock(m_acceptorMutex);
-		if (m_acceptor) {
-			acceptorToClose = m_acceptor;
-			m_acceptor = nullptr;
-		}
-	}
+	uv_tcp_t* socketToClose = m_socket.exchange(nullptr, std::memory_order_acq_rel);
+	uv_tcp_t* acceptorToClose = m_acceptor.exchange(nullptr, std::memory_order_acq_rel);
 
 	if (socketToClose || acceptorToClose) {
 		g_EventLoop.Post([socketToClose, acceptorToClose]() {
@@ -245,15 +231,7 @@ bool TcpSocket::Disconnect() {
 }
 
 bool TcpSocket::CloseReset() {
-	uv_tcp_t* socketToClose = nullptr;
-
-	{
-		std::scoped_lock lock(m_socketMutex);
-		if (m_socket) {
-			socketToClose = m_socket;
-			m_socket = nullptr;
-		}
-	}
+	uv_tcp_t* socketToClose = m_socket.exchange(nullptr, std::memory_order_acq_rel);
 
 	if (socketToClose) {
 		g_EventLoop.Post([socketToClose]() {
@@ -273,40 +251,37 @@ bool TcpSocket::Listen() {
 	}
 
 	g_EventLoop.Post([this]() {
-		{
-			std::scoped_lock lock(m_acceptorMutex);
+		if (IsDeleted()) return;
 
-			if (!m_acceptor) {
-				m_acceptor = new uv_tcp_t;
-				uv_tcp_init(g_EventLoop.GetLoop(), m_acceptor);
-				m_acceptor->data = this;
+		uv_tcp_t* expected = nullptr;
+		uv_tcp_t* newAcceptor = new uv_tcp_t;
+		uv_tcp_init(g_EventLoop.GetLoop(), newAcceptor);
+		newAcceptor->data = this;
 
-				int result = uv_tcp_bind(m_acceptor, reinterpret_cast<const sockaddr*>(&m_localAddr), 0);
-				if (result != 0) {
-					g_CallbackManager.Enqueue(CallbackEvent::Error, this, SocketError::BindError, result);
-					uv_close(reinterpret_cast<uv_handle_t*>(m_acceptor), OnClose);
-					m_acceptor = nullptr;
-					return;
-				}
-
-				uv_os_sock_t socketFd;
-				if (uv_fileno(reinterpret_cast<uv_handle_t*>(m_acceptor), reinterpret_cast<uv_os_fd_t*>(&socketFd)) == 0) {
-					std::scoped_lock optionsLock(m_optionsMutex);
-					while (!m_pendingOptions.empty()) {
-						auto& option = m_pendingOptions.front();
-						SetSocketOption(socketFd, option.option, option.value);
-						m_pendingOptions.pop();
-					}
-				}
-			}
-
-			int result = uv_listen(reinterpret_cast<uv_stream_t*>(m_acceptor), SOMAXCONN, OnConnection);
-			if (result != 0) {
-				g_CallbackManager.Enqueue(CallbackEvent::Error, this, SocketError::ListenError, result);
-				return;
-			}
+		if (!m_acceptor.compare_exchange_strong(expected, newAcceptor,
+			std::memory_order_release, std::memory_order_acquire)) {
+			// Already has an acceptor
+			uv_close(reinterpret_cast<uv_handle_t*>(newAcceptor), OnClose);
+			return;
 		}
-		g_CallbackManager.Enqueue(CallbackEvent::Listen, this, GetLocalEndpoint());
+
+		int result = uv_tcp_bind(newAcceptor, reinterpret_cast<const sockaddr*>(&m_localAddr), 0);
+		if (result != 0) {
+			g_CallbackManager.EnqueueError(this, SocketError::BindError, uv_strerror(result));
+			m_acceptor.store(nullptr, std::memory_order_release);
+			uv_close(reinterpret_cast<uv_handle_t*>(newAcceptor), OnClose);
+			return;
+		}
+
+		ApplyPendingOptions(reinterpret_cast<uv_handle_t*>(newAcceptor));
+
+		result = uv_listen(reinterpret_cast<uv_stream_t*>(newAcceptor), SOMAXCONN, OnConnection);
+		if (result != 0) {
+			g_CallbackManager.EnqueueError(this, SocketError::ListenError, uv_strerror(result));
+			return;
+		}
+
+		g_CallbackManager.EnqueueListen(this, GetLocalEndpoint());
 	});
 
 	return true;
@@ -315,10 +290,11 @@ bool TcpSocket::Listen() {
 void TcpSocket::OnConnection(uv_stream_t* server, int status) {
 	auto* socket = static_cast<TcpSocket*>(server->data);
 
+	if (socket->IsDeleted()) return;
+
 	if (status < 0) {
 		if (status != UV_ECANCELED) {
-			g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-				SocketError::ListenError, status);
+			g_CallbackManager.EnqueueError(socket, SocketError::ListenError, uv_strerror(status));
 		}
 		return;
 	}
@@ -329,7 +305,8 @@ void TcpSocket::OnConnection(uv_stream_t* server, int status) {
 	if (uv_accept(server, reinterpret_cast<uv_stream_t*>(clientHandle)) == 0) {
 		TcpSocket* newSocket = TcpSocket::CreateFromAccepted(clientHandle);
 		if (newSocket) {
-			g_CallbackManager.Enqueue(CallbackEvent::Incoming, socket, newSocket);
+			RemoteEndpoint endpoint = newSocket->GetRemoteEndpoint();
+			g_CallbackManager.EnqueueIncoming(socket, newSocket, endpoint);
 			newSocket->StartReceiving();
 		}
 	} else {
@@ -339,45 +316,54 @@ void TcpSocket::OnConnection(uv_stream_t* server, int status) {
 
 TcpSocket* TcpSocket::CreateFromAccepted(uv_tcp_t* clientHandle) {
 	auto* socket = g_SocketManager.CreateSocket<TcpSocket>();
-	socket->m_socket = clientHandle;
+	socket->m_socket.store(clientHandle, std::memory_order_release);
 	clientHandle->data = socket;
 
 	sockaddr_storage peerAddress;
 	int addressLength = sizeof(peerAddress);
 	if (uv_tcp_getpeername(clientHandle, reinterpret_cast<sockaddr*>(&peerAddress), &addressLength) == 0) {
 		socket->m_remoteEndpoint = ExtractEndpoint(reinterpret_cast<sockaddr*>(&peerAddress));
+		std::atomic_thread_fence(std::memory_order_release);
+		socket->m_remoteEndpointSet.store(true, std::memory_order_release);
 	}
 
 	return socket;
 }
 
 void TcpSocket::StartReceiving() {
-	std::scoped_lock lock(m_socketMutex);
-	if (!m_socket) return;
+	uv_tcp_t* socket = m_socket.load(std::memory_order_acquire);
+	if (!socket) return;
 
-	uv_read_start(reinterpret_cast<uv_stream_t*>(m_socket), OnAllocBuffer, OnRead);
+	uv_read_start(reinterpret_cast<uv_stream_t*>(socket), OnAllocBuffer, OnRead);
 }
 
 void TcpSocket::OnAllocBuffer(uv_handle_t* handle, size_t suggestedSize, uv_buf_t* buffer) {
-	buffer->base = new char[kRecvBufferSize];
+	auto* socket = static_cast<TcpSocket*>(handle->data);
+	buffer->base = socket->m_recvBuffer;
 	buffer->len = kRecvBufferSize;
 }
 
 void TcpSocket::OnRead(uv_stream_t* stream, ssize_t bytesRead, const uv_buf_t* buffer) {
 	auto* socket = static_cast<TcpSocket*>(stream->data);
 
-	if (bytesRead > 0) {
-		g_CallbackManager.Enqueue(CallbackEvent::Receive, socket, buffer->base, bytesRead, socket->GetRemoteEndpoint());
-	} else if (bytesRead < 0) {
-		if (bytesRead == UV_EOF || bytesRead == UV_ECONNRESET || bytesRead == UV_ECONNABORTED) {
-			g_CallbackManager.Enqueue(CallbackEvent::Disconnect, socket);
-		} else if (bytesRead != UV_ECANCELED) {
-			g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-				SocketError::RecvError, static_cast<int>(bytesRead));
-		}
+	if (socket->IsDeleted()) {
+		return;
 	}
 
-	delete[] buffer->base;
+	if (bytesRead > 0) {
+		RemoteEndpoint endpoint;
+		if (socket->m_remoteEndpointSet.load(std::memory_order_acquire)) {
+			std::atomic_thread_fence(std::memory_order_acquire);
+			endpoint = socket->m_remoteEndpoint;
+		}
+		g_CallbackManager.EnqueueReceive(socket, buffer->base, bytesRead, endpoint);
+	} else if (bytesRead < 0) {
+		if (bytesRead == UV_EOF || bytesRead == UV_ECONNRESET || bytesRead == UV_ECONNABORTED) {
+			g_CallbackManager.EnqueueDisconnect(socket);
+		} else if (bytesRead != UV_ECANCELED) {
+			g_CallbackManager.EnqueueError(socket, SocketError::RecvError, uv_strerror(static_cast<int>(bytesRead)));
+		}
+	}
 }
 
 bool TcpSocket::Send(std::string_view data, bool async) {
@@ -386,21 +372,25 @@ bool TcpSocket::Send(std::string_view data, bool async) {
 	std::memcpy(context->buffer.get(), data.data(), data.length());
 	context->length = data.length();
 	context->socket = this;
-	context->handlerLock = std::make_unique<SharedLock>(m_handlerMutex);
 	context->writeRequest.data = context;
 
 	g_EventLoop.Post([this, context]() {
-		std::scoped_lock lock(m_socketMutex);
-		if (!m_socket) {
+		if (IsDeleted()) {
+			delete context;
+			return;
+		}
+
+		uv_tcp_t* socket = m_socket.load(std::memory_order_acquire);
+		if (!socket) {
 			delete context;
 			return;
 		}
 
 		uv_buf_t uvBuffer = uv_buf_init(context->buffer.get(), static_cast<unsigned int>(context->length));
-		int result = uv_write(&context->writeRequest, reinterpret_cast<uv_stream_t*>(m_socket), &uvBuffer, 1, OnWrite);
+		int result = uv_write(&context->writeRequest, reinterpret_cast<uv_stream_t*>(socket), &uvBuffer, 1, OnWrite);
 
 		if (result != 0) {
-			g_CallbackManager.Enqueue(CallbackEvent::Error, this, SocketError::SendError, result);
+			g_CallbackManager.EnqueueError(this, SocketError::SendError, uv_strerror(result));
 			delete context;
 		}
 	});
@@ -412,9 +402,8 @@ void TcpSocket::OnWrite(uv_write_t* request, int status) {
 	auto* context = static_cast<TcpWriteContext*>(request->data);
 	auto* socket = context->socket;
 
-	if (status != 0 && status != UV_ECANCELED) {
-		g_CallbackManager.Enqueue(CallbackEvent::Error, socket,
-			SocketError::SendError, status);
+	if (!socket->IsDeleted() && status != 0 && status != UV_ECANCELED) {
+		g_CallbackManager.EnqueueError(socket, SocketError::SendError, uv_strerror(status));
 	}
 
 	delete context;
@@ -425,17 +414,17 @@ bool TcpSocket::SendTo(std::string_view data, const char* hostname, uint16_t por
 }
 
 bool TcpSocket::SetOption(SocketOption option, int value) {
-	if (option == SocketOption::ConnectTimeout || option == SocketOption::AutoClose) {
-		std::scoped_lock lock(m_optionsMutex);
-		m_options[option] = value;
+	// Store in atomic array for immediate reads
+	StoreOption(option, value);
+
+	if (option == SocketOption::ConnectTimeout || option == SocketOption::AutoFreeHandle) {
 		return true;
 	}
 
-	std::scoped_lock lock(m_socketMutex);
-
-	if (m_socket) {
+	uv_tcp_t* socket = m_socket.load(std::memory_order_acquire);
+	if (socket) {
 		uv_os_sock_t socketFd;
-		if (uv_fileno(reinterpret_cast<uv_handle_t*>(m_socket), reinterpret_cast<uv_os_fd_t*>(&socketFd)) == 0) {
+		if (uv_fileno(reinterpret_cast<uv_handle_t*>(socket), reinterpret_cast<uv_os_fd_t*>(&socketFd)) == 0) {
 			return SetSocketOption(socketFd, option, value);
 		}
 	}
@@ -445,14 +434,18 @@ bool TcpSocket::SetOption(SocketOption option, int value) {
 }
 
 RemoteEndpoint TcpSocket::GetRemoteEndpoint() const {
-	std::scoped_lock lock(m_endpointMutex);
-	return m_remoteEndpoint;
+	if (m_remoteEndpointSet.load(std::memory_order_acquire)) {
+		std::atomic_thread_fence(std::memory_order_acquire);
+		return m_remoteEndpoint;
+	}
+	return {};
 }
 
 RemoteEndpoint TcpSocket::GetLocalEndpoint() const {
-	std::scoped_lock lock(m_socketMutex, m_acceptorMutex);
+	uv_tcp_t* socket = m_socket.load(std::memory_order_acquire);
+	uv_tcp_t* acceptor = m_acceptor.load(std::memory_order_acquire);
 
-	uv_tcp_t* handle = m_socket ? m_socket : m_acceptor;
+	uv_tcp_t* handle = socket ? socket : acceptor;
 	if (!handle) return {};
 
 	sockaddr_storage addr;
@@ -476,20 +469,15 @@ void TcpSocket::OnShutdown(uv_shutdown_t* request, int status) {
 void TcpSocket::OnConnectTimeout(uv_timer_t* timer) {
 	auto* socket = static_cast<TcpSocket*>(timer->data);
 
-	uv_tcp_t* socketToClose = nullptr;
-	{
-		std::scoped_lock lock(socket->m_socketMutex);
-		if (socket->m_socket) {
-			socketToClose = socket->m_socket;
-			socket->m_socket = nullptr;
-		}
-	}
+	uv_tcp_t* socketToClose = socket->m_socket.exchange(nullptr, std::memory_order_acq_rel);
 
 	if (socketToClose && !uv_is_closing(reinterpret_cast<uv_handle_t*>(socketToClose))) {
 		uv_close(reinterpret_cast<uv_handle_t*>(socketToClose), OnClose);
 	}
 
-	g_CallbackManager.Enqueue(CallbackEvent::Error, socket, SocketError::ConnectError, UV_ETIMEDOUT);
+	if (!socket->IsDeleted()) {
+		g_CallbackManager.EnqueueError(socket, SocketError::ConnectError, "Connection timed out");
+	}
 
 	uv_close(reinterpret_cast<uv_handle_t*>(timer), [](uv_handle_t* handle) {
 		delete reinterpret_cast<uv_timer_t*>(handle);

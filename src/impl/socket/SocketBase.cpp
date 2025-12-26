@@ -13,15 +13,20 @@
 SocketBase::SocketBase(SocketType type) : m_type(type) {}
 
 SocketBase::~SocketBase() {
-	std::unique_lock<std::shared_mutex> lock(m_handlerMutex);
-	std::scoped_lock optionsLock(m_optionsMutex);
+	// Mark as deleted so UV thread will skip any pending callbacks
+	MarkDeleted();
+
+	// Clear pending options
 	while (!m_pendingOptions.empty()) {
 		m_pendingOptions.pop();
 	}
 }
 
 void SocketBase::QueueOption(SocketOption option, int value) {
-	std::scoped_lock lock(m_optionsMutex);
+	// Store in atomic array for immediate reads
+	StoreOption(option, value);
+
+	// Also queue for socket-level application
 	m_pendingOptions.emplace(option, value);
 }
 
@@ -71,5 +76,18 @@ bool SocketBase::SetSocketOption(uv_os_sock_t socketFd, SocketOption option, int
 		}
 		default:
 			return false;
+	}
+}
+
+void SocketBase::ApplyPendingOptions(uv_handle_t* handle) {
+	if (!handle) return;
+
+	uv_os_sock_t socketFd;
+	if (uv_fileno(handle, reinterpret_cast<uv_os_fd_t*>(&socketFd)) == 0) {
+		while (!m_pendingOptions.empty()) {
+			auto& option = m_pendingOptions.front();
+			SetSocketOption(socketFd, option.option, option.value);
+			m_pendingOptions.pop();
+		}
 	}
 }

@@ -3,8 +3,6 @@
 
 #include "smsdk_ext.h"
 
-struct SocketWrapper;
-
 class SocketExtension : public SDKExtension, public IHandleTypeDispatch {
 public:
 	bool SDK_OnLoad(char* error, size_t maxlen, bool late) override;

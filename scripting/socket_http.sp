@@ -1,3 +1,23 @@
+/**
+ * Socket HTTP GET Example
+ *
+ * Demonstrates simple HTTP GET requests using TCP sockets.
+ * Supports multiple concurrent requests.
+ *
+ * Commands:
+ *   sm_httpget <host> [port] [path] - Make HTTP GET request
+ *
+ * Usage:
+ *   sm_httpget example.com              - GET http://example.com/
+ *   sm_httpget example.com 80 /api      - GET http://example.com/api
+ *   sm_httpget api.example.com 8080 /v1 - GET http://api.example.com:8080/v1
+ *
+ * Note: This is a basic HTTP/1.1 client. For HTTPS, use a dedicated HTTP library.
+ */
+
+#pragma semicolon 1
+#pragma newdecls required
+
 #include <sourcemod>
 #include <socket>
 
@@ -9,7 +29,6 @@ public Plugin myinfo = {
 	url = "https://github.com/ProjectSky/sm-ext-socket"
 }
 
-// HTTP request context
 enum struct HttpRequest {
 	Socket socket;
 	char host[128];
@@ -26,7 +45,6 @@ public void OnPluginStart() {
 	RegConsoleCmd("sm_httpget", Command_HttpGet, "Make HTTP GET request");
 }
 
-// Usage: sm_httpget <host> [port] [path]
 Action Command_HttpGet(int client, int args) {
 	if (args < 1) {
 		ReplyToCommand(client, "Usage: sm_httpget <host> [port] [path]");
@@ -51,11 +69,11 @@ Action Command_HttpGet(int client, int args) {
 	}
 
 	req.socket = new Socket();
-	req.socket.SetOption(SocketConnectTimeout, 10000);  // 10 second timeout
-	req.socket.SetConnectCallback(OnHttpConnect);
-	req.socket.SetReceiveCallback(OnHttpReceive);
-	req.socket.SetDisconnectCallback(OnHttpDisconnect);
-	req.socket.SetErrorCallback(OnHttpError);
+	req.socket.SetOption(SocketConnectTimeout, 10000);
+	req.socket.SetConnectCallback(Socket_OnConnect);
+	req.socket.SetReceiveCallback(Socket_OnReceive);
+	req.socket.SetDisconnectCallback(Socket_OnDisconnect);
+	req.socket.SetErrorCallback(Socket_OnError);
 
 	int index = g_Requests.PushArray(req);
 	req.socket.Connect(req.host, req.port);
@@ -65,7 +83,7 @@ Action Command_HttpGet(int client, int args) {
 	return Plugin_Handled;
 }
 
-static void OnHttpConnect(Socket socket, any data) {
+void Socket_OnConnect(Socket socket, any data) {
 	int index = FindRequestBySocket(socket);
 	if (index == -1) return;
 
@@ -85,7 +103,7 @@ static void OnHttpConnect(Socket socket, any data) {
 	socket.Send(request);
 }
 
-static void OnHttpReceive(Socket socket, const char[] buffer, const int size, const char[] senderIP, int senderPort, any data) {
+void Socket_OnReceive(Socket socket, const char[] buffer, const int size, const char[] senderIP, int senderPort, any data) {
 	int index = FindRequestBySocket(socket);
 	if (index == -1) return;
 
@@ -106,7 +124,7 @@ static void OnHttpReceive(Socket socket, const char[] buffer, const int size, co
 	g_Requests.SetArray(index, req);
 }
 
-static void OnHttpDisconnect(Socket socket, any data) {
+void Socket_OnDisconnect(Socket socket, any data) {
 	int index = FindRequestBySocket(socket);
 	if (index == -1) return;
 
@@ -134,14 +152,14 @@ static void OnHttpDisconnect(Socket socket, any data) {
 	CleanupRequest(index);
 }
 
-static void OnHttpError(Socket socket, const int errorType, const int errorNum, any data) {
+void Socket_OnError(Socket socket, const int errorType, const char[] errorMsg, any data) {
 	int index = FindRequestBySocket(socket);
 	if (index == -1) return;
 
 	HttpRequest req;
 	g_Requests.GetArray(index, req);
 
-	PrintToServer("[HTTP] Error for %s:%d: type=%d, errno=%d", req.host, req.port, errorType, errorNum);
+	PrintToServer("[HTTP] Error for %s:%d: type=%d, message=%s", req.host, req.port, errorType, errorMsg);
 	CleanupRequest(index);
 }
 
@@ -161,13 +179,4 @@ void CleanupRequest(int index) {
 	g_Requests.GetArray(index, req);
 	delete req.socket;
 	g_Requests.Erase(index);
-}
-
-public void OnPluginEnd() {
-	HttpRequest req;
-	for (int i = 0; i < g_Requests.Length; i++) {
-		g_Requests.GetArray(i, req);
-		delete req.socket;
-	}
-	delete g_Requests;
 }

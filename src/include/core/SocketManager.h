@@ -4,19 +4,19 @@
 #include "socket/SocketBase.h"
 #include "socket/TcpSocket.h"
 #include "socket/UdpSocket.h"
-#include <unordered_map>
-#include <mutex>
-#include <memory>
+#include "socket/UnixSocket.h"
+#include "lockfree/LockFreeMap.h"
 
-struct SocketWrapper {
-	SocketWrapper(SocketBase* socketInstance, SocketType type)
-		: socket(socketInstance), socketType(type) {}
-	~SocketWrapper();
-
-	SocketBase* socket;
-	SocketType socketType;
-};
-
+/**
+ * Lock-free socket manager using LockFreeMap.
+ *
+ * Thread model:
+ * - Game thread: creates and destroys sockets
+ * - UV thread: looks up sockets for callback enqueuing
+ *
+ * The LockFreeMap allows concurrent reads from UV thread while
+ * game thread performs modifications.
+ */
 class SocketManager {
 public:
 	SocketManager() = default;
@@ -27,31 +27,37 @@ public:
 
 	void Shutdown();
 
-	SocketWrapper* FindWrapper(const SocketBase* socket);
+	/**
+	 * Check if a socket exists and is not deleted.
+	 * Thread-safe, can be called from any thread.
+	 */
+	bool IsValidSocket(const SocketBase* socket);
 
+	/**
+	 * Create a new socket of the specified type.
+	 * Must be called from game thread.
+	 */
 	template<typename T>
 	T* CreateSocket();
 
-	void DestroySocket(SocketWrapper* wrapper);
+	/**
+	 * Destroy a socket.
+	 * Must be called from game thread.
+	 */
+	void DestroySocket(SocketBase* socket);
 
 	void Start();
 	void Stop();
 
 private:
-	std::unordered_map<const SocketBase*, SocketWrapper*> m_socketMap;
-	std::mutex m_socketMapMutex;
+	// Lock-free set for socket registry (value is just a marker, we use the key)
+	LockFreeMap<const SocketBase*, bool> m_socketMap;
 };
 
 template<typename T>
 T* SocketManager::CreateSocket() {
-	std::scoped_lock lock(m_socketMapMutex);
-
 	T* socket = new T();
-	SocketType type = socket->GetType();
-
-	auto* wrapper = new SocketWrapper(socket, type);
-	m_socketMap[socket] = wrapper;
-
+	m_socketMap.insert(socket, true);
 	return socket;
 }
 

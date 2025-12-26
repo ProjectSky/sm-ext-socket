@@ -5,7 +5,8 @@
 
 enum SocketType {
 	SOCKET_TCP = 1,
-	SOCKET_UDP
+	SOCKET_UDP,
+	SOCKET_UNIX
 }
 
 enum SocketErrorType {
@@ -36,13 +37,13 @@ enum SocketOption {
 	SocketSendTimeout,         // SO_SNDTIMEO (ms, 0 = disabled)
 	DebugMode,                 // Enable debug logging
 	SocketConnectTimeout,      // Connect timeout (ms, 0 = disabled, TCP only)
-	SocketAutoClose            // Auto close handle on disconnect/error (0 = disabled, 1 = enabled)
+	SocketAutoFreeHandle       // Auto close handle on disconnect/error (0 = disabled, 1 = enabled)
 }
 
 /**
  * Callback for connection established
  *
- * @note TCP: Called when connection to remote host is established
+ * @note TCP/Unix: Called when connection to remote host is established
  * @note UDP: Called when Connect() hostname resolution completes (UDP is connectionless)
  *
  * @param socket    Socket handle
@@ -53,13 +54,13 @@ typedef SocketConnectCallback = function void (Socket socket, any data);
 /**
  * Callback for incoming connection on listening socket
  *
- * @note TCP only: Called when a new client connects to a listening socket
+ * @note TCP/Unix: Called when a new client connects to a listening socket
  * @note UDP: Not applicable (UDP is connectionless, use ReceiveCallback instead)
  *
  * @param socket      Listening socket handle
  * @param newSocket   New client socket handle
- * @param remoteIP    Client IP address
- * @param remotePort  Client port
+ * @param remoteIP    Client IP address (Unix: socket path)
+ * @param remotePort  Client port (Unix: 0)
  * @param data        User data passed to SetIncomingCallback
  */
 typedef SocketIncomingCallback = function void (Socket socket, Socket newSocket, const char[] remoteIP, int remotePort, any data);
@@ -67,14 +68,14 @@ typedef SocketIncomingCallback = function void (Socket socket, Socket newSocket,
 /**
  * Callback for data received
  *
- * @note TCP: Called when data is received from connected peer
+ * @note TCP/Unix: Called when data is received from connected peer
  * @note UDP: Called when data is received from any sender
  *
  * @param socket      Socket handle
  * @param buffer      Received data (null-terminated)
  * @param size        Data length (excluding null terminator)
- * @param senderIP    Sender IP address (UDP only, empty for TCP)
- * @param senderPort  Sender port (UDP only, 0 for TCP)
+ * @param senderIP    Sender IP address (TCP: remote peer, UDP: packet sender, Unix: empty)
+ * @param senderPort  Sender port (Unix: 0)
  * @param data        User data passed to SetReceiveCallback
  */
 typedef SocketReceiveCallback = function void (Socket socket, const char[] buffer, const int size, const char[] senderIP, int senderPort, any data);
@@ -82,7 +83,7 @@ typedef SocketReceiveCallback = function void (Socket socket, const char[] buffe
 /**
  * Callback for remote disconnection
  *
- * @note TCP only: Called when remote peer closes the connection
+ * @note TCP/Unix: Called when remote peer closes the connection
  * @note UDP: Not applicable (UDP is connectionless)
  *
  * @param socket    Socket handle
@@ -93,26 +94,26 @@ typedef SocketDisconnectCallback = function void (Socket socket, any data);
 /**
  * Callback for socket error
  *
- * @param socket      Socket handle
- * @param errorType   Error type (SocketErrorType)
- * @param errorNum    System errno
- * @param data        User data passed to SetErrorCallback
+ * @param socket        Socket handle
+ * @param errorType     Error type (SocketErrorType)
+ * @param errorMsg      Error message string
+ * @param data          User data passed to SetErrorCallback
  */
-typedef SocketErrorCallback = function void (Socket socket, const int errorType, const int errorNum, any data);
+typedef SocketErrorCallback = function void (Socket socket, const int errorType, const char[] errorMsg, any data);
 
 /**
  * Callback for listen ready
  *
- * @note Called when Listen() completes and socket is ready to accept connections (TCP) or receive data (UDP)
+ * @note Called when Listen() completes and socket is ready to accept connections (TCP/Unix) or receive data (UDP)
  *
  * @param socket       Socket handle
- * @param localIP      Local bound IP address
- * @param localPort    Local bound port
+ * @param localIP      Local bound IP address (Unix: socket path)
+ * @param localPort    Local bound port (Unix: 0)
  * @param data         User data passed to SetListenCallback
  */
 typedef SocketListenCallback = function void (Socket socket, const char[] localIP, int localPort, any data);
 
-// Socket methodmap for TCP/UDP communication
+// Socket methodmap for TCP/UDP/Unix communication
 methodmap Socket < Handle {
 	/**
 	 * Creates a new socket
@@ -136,9 +137,10 @@ methodmap Socket < Handle {
 	 *
 	 * @note TCP: Establishes a connection to the remote host
 	 * @note UDP: Sets default destination for Send() (no actual connection)
+	 * @note Unix: Connects to the specified socket path (port is ignored)
 	 *
-	 * @param host    Remote IP or hostname
-	 * @param port    Remote port
+	 * @param host    Remote IP or hostname (Unix: socket path)
+	 * @param port    Remote port (Unix: ignored)
 	 */
 	public native void Connect(const char[] host, int port);
 
@@ -153,16 +155,16 @@ methodmap Socket < Handle {
 	 * Forcefully closes TCP connection with RST (TCP only)
 	 *
 	 * @note Immediately terminates connection without TIME_WAIT state
-	 * @note Only works for TCP sockets, returns false for UDP
+	 * @note Only works for TCP sockets, returns false for UDP/Unix
 	 *
 	 * @return    True on success
 	 */
 	public native bool CloseReset();
 
 	/**
-	 * Starts listening for connections (TCP) or receiving data (UDP)
+	 * Starts listening for connections (TCP/Unix) or receiving data (UDP)
 	 *
-	 * @note TCP: Starts accepting incoming connections (requires SetIncomingCallback)
+	 * @note TCP/Unix: Starts accepting incoming connections (requires SetIncomingCallback)
 	 * @note UDP: Starts receiving data (use SetReceiveCallback)
 	 *
 	 * @return    True on success
@@ -172,7 +174,7 @@ methodmap Socket < Handle {
 	/**
 	 * Sends data
 	 *
-	 * @note TCP: Sends to connected peer
+	 * @note TCP/Unix: Sends to connected peer
 	 * @note UDP: Requires prior Connect() call to set destination
 	 *
 	 * @param data    Data to send
@@ -195,7 +197,7 @@ methodmap Socket < Handle {
 	 *
 	 * @param option    Option to set
 	 * @param value     Option value
-	 * @return          True on success false on failure
+	 * @return          True on success, false on failure
 	 */
 	public native bool SetOption(SocketOption option, int value);
 
@@ -232,9 +234,9 @@ methodmap Socket < Handle {
 	public native void SetConnectCallback(SocketConnectCallback callback, any data = 0);
 
 	/**
-	 * Sets incoming connection callback (TCP only)
+	 * Sets incoming connection callback (TCP/Unix only)
 	 *
-	 * @note Required for TCP server mode. Not applicable for UDP.
+	 * @note Required for TCP/Unix server mode. Not applicable for UDP.
 	 *
 	 * @param callback    Callback function
 	 * @param data        User data passed to callback
@@ -256,7 +258,7 @@ methodmap Socket < Handle {
 	 *
 	 * @param buffer       Destination buffer
 	 * @param maxLength    Buffer size
-	 * @return             True on success false on failure
+	 * @return             True on success, false on failure
 	 */
 	public static native bool GetHostName(char[] buffer, int maxLength);
 
@@ -268,7 +270,7 @@ methodmap Socket < Handle {
 	 *
 	 * @param buffer       Destination buffer
 	 * @param maxLength    Buffer size
-	 * @return             True on success false on failure
+	 * @return             True on success, false on failure
 	 */
 	public native bool GetLocalAddress(char[] buffer, int maxLength);
 
@@ -283,7 +285,10 @@ methodmap Socket < Handle {
 	public native int GetLocalPort();
 
 	/**
-	 * Whether socket is connected
+	 * Whether socket is connected/listening
+	 *
+	 * @note TCP/Unix: True if connected to peer or listening for connections
+	 * @note UDP: True if socket is initialized
 	 */
 	property bool Connected {
 		public native get();

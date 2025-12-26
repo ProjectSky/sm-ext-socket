@@ -16,6 +16,7 @@ for cxx in builder.targets:
     'src/impl/socket/SocketBase.cpp',
     'src/impl/socket/TcpSocket.cpp',
     'src/impl/socket/UdpSocket.cpp',
+    'src/impl/socket/UnixSocket.cpp',
     'src/impl/socket/SocketUtils.cpp',
     os.path.join(Extension.sm_root, 'public', 'smsdk_ext.cpp'),
   ]

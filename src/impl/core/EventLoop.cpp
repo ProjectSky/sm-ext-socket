@@ -1,7 +1,19 @@
 #include "core/EventLoop.h"
-#include <cassert>
 
 EventLoop g_EventLoop;
+
+// Helper struct for std::function wrapper
+struct FunctionWrapper {
+	std::function<void()> func;
+};
+
+static void ExecuteFunctionWrapper(void* data) {
+	auto* wrapper = static_cast<FunctionWrapper*>(data);
+	if (wrapper) {
+		wrapper->func();
+		delete wrapper;
+	}
+}
 
 EventLoop::EventLoop() {
 	m_loop = new uv_loop_t;
@@ -13,7 +25,7 @@ EventLoop::EventLoop() {
 }
 
 EventLoop::~EventLoop() {
-	if (m_running.load()) {
+	if (m_running.load(std::memory_order_acquire)) {
 		Stop();
 	}
 
@@ -30,21 +42,21 @@ EventLoop::~EventLoop() {
 }
 
 void EventLoop::Start() {
-	if (m_running.load()) {
+	if (m_running.load(std::memory_order_acquire)) {
 		return;
 	}
 
-	m_running.store(true);
-	m_stopping.store(false);
+	m_running.store(true, std::memory_order_release);
+	m_stopping.store(false, std::memory_order_release);
 	m_thread = std::thread(&EventLoop::Run, this);
 }
 
 void EventLoop::Stop() {
-	if (!m_running.load()) {
+	if (!m_running.load(std::memory_order_acquire)) {
 		return;
 	}
 
-	m_stopping.store(true);
+	m_stopping.store(true, std::memory_order_release);
 
 	uv_async_send(m_async);
 
@@ -55,38 +67,51 @@ void EventLoop::Stop() {
 		m_thread.join();
 	}
 
-	m_running.store(false);
+	m_running.store(false, std::memory_order_release);
 }
 
 void EventLoop::Run() {
-	while (!m_stopping.load()) {
+	while (!m_stopping.load(std::memory_order_acquire)) {
 		uv_run(m_loop, UV_RUN_DEFAULT);
 
-		if (!m_stopping.load()) {
+		if (!m_stopping.load(std::memory_order_acquire)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
 	}
 }
 
-void EventLoop::Post(std::function<void()> callback) {
-	{
-		std::scoped_lock lock(m_callbackMutex);
-		m_pendingCallbacks.push_back(std::move(callback));
+bool EventLoop::Post(void (*callback)(void*), void* data) {
+	AsyncJob job(callback, data);
+
+	if (!m_jobQueue.try_enqueue(std::move(job))) {
+		return false;
 	}
+
 	uv_async_send(m_async);
+	return true;
+}
+
+bool EventLoop::Post(std::function<void()> callback) {
+	// Allocate wrapper on heap (will be freed by ExecuteFunctionWrapper)
+	auto* wrapper = new FunctionWrapper{std::move(callback)};
+
+	if (!Post(ExecuteFunctionWrapper, wrapper)) {
+		delete wrapper;
+		return false;
+	}
+
+	return true;
 }
 
 void EventLoop::OnAsync(uv_async_t* handle) {
 	auto* self = static_cast<EventLoop*>(handle->data);
 
-	std::vector<std::function<void()>> callbacks;
-	{
-		std::scoped_lock lock(self->m_callbackMutex);
-		callbacks.swap(self->m_pendingCallbacks);
-	}
-
-	for (auto& cb : callbacks) {
-		cb();
+	// Process all pending jobs
+	AsyncJob job;
+	while (self->m_jobQueue.try_dequeue(job)) {
+		if (job.callback) {
+			job.callback(job.data);
+		}
 	}
 }
 

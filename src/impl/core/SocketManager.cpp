@@ -1,14 +1,8 @@
 #include "core/SocketManager.h"
 #include "core/EventLoop.h"
-#include "core/CallbackManager.h"
 #include <cassert>
 
 SocketManager g_SocketManager;
-
-SocketWrapper::~SocketWrapper() {
-	delete socket;
-	g_CallbackManager.RemoveByWrapper(this);
-}
 
 SocketManager::~SocketManager() {
 	if (!m_socketMap.empty()) {
@@ -19,31 +13,31 @@ SocketManager::~SocketManager() {
 void SocketManager::Shutdown() {
 	Stop();
 
-	std::scoped_lock lock(m_socketMapMutex);
-
-	for (auto& [socket, wrapper] : m_socketMap) {
-		delete wrapper;
-	}
+	// Delete all sockets
+	m_socketMap.for_each([](const SocketBase* key, bool) {
+		delete const_cast<SocketBase*>(key);
+	});
 
 	m_socketMap.clear();
 }
 
-SocketWrapper* SocketManager::FindWrapper(const SocketBase* socket) {
-	std::scoped_lock lock(m_socketMapMutex);
-
-	auto it = m_socketMap.find(socket);
-	return (it != m_socketMap.end()) ? it->second : nullptr;
+bool SocketManager::IsValidSocket(const SocketBase* socket) {
+	if (!socket) return false;
+	if (socket->IsDeleted()) return false;
+	return m_socketMap.find(socket);
 }
 
-void SocketManager::DestroySocket(SocketWrapper* wrapper) {
-	assert(wrapper);
+void SocketManager::DestroySocket(SocketBase* socket) {
+	assert(socket);
 
-	{
-		std::scoped_lock lock(m_socketMapMutex);
-		m_socketMap.erase(wrapper->socket);
-	}
+	// Mark as deleted first
+	socket->MarkDeleted();
 
-	delete wrapper;
+	// Remove from map
+	m_socketMap.remove(socket);
+
+	// Delete socket
+	delete socket;
 }
 
 void SocketManager::Start() {

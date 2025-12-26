@@ -1,226 +1,279 @@
 #include "core/CallbackManager.h"
-#include "core/SocketManager.h"
 #include "socket/SocketBase.h"
-#include "socket/TcpSocket.h"
-#include "socket/UdpSocket.h"
 #include "extension.h"
+#include <cstring>
+#include <cstdlib>
 
 CallbackManager g_CallbackManager;
 
-QueuedCallback::QueuedCallback(CallbackEvent event, SocketBase* socket)
-	: m_event(event) {
-	m_socketWrapper = g_SocketManager.FindWrapper(socket);
-}
+void CallbackManager::EnqueueConnect(SocketBase* socket, const RemoteEndpoint& endpoint) {
+	QueuedConnectEvent event;
+	event.socket = socket;
+	event.remoteEndpoint = endpoint;
 
-QueuedCallback::QueuedCallback(CallbackEvent event, SocketBase* socket, const RemoteEndpoint& localEndpoint)
-	: m_event(event) {
-	m_socketWrapper = g_SocketManager.FindWrapper(socket);
-	m_payload.endpoint = localEndpoint;
-}
-
-QueuedCallback::QueuedCallback(CallbackEvent event, SocketBase* socket, const char* data, size_t length)
-	: m_event(event) {
-	m_socketWrapper = g_SocketManager.FindWrapper(socket);
-	m_payload.receiveData.assign(data, length);
-}
-
-QueuedCallback::QueuedCallback(CallbackEvent event, SocketBase* socket, const char* data, size_t length, const RemoteEndpoint& sender)
-	: m_event(event) {
-	m_socketWrapper = g_SocketManager.FindWrapper(socket);
-	m_payload.receiveData.assign(data, length);
-	m_payload.endpoint = sender;
-}
-
-QueuedCallback::QueuedCallback(CallbackEvent event, SocketBase* socket, SocketBase* newSocket, const RemoteEndpoint& endpoint)
-	: m_event(event) {
-	m_socketWrapper = g_SocketManager.FindWrapper(socket);
-	m_payload.newSocket = newSocket;
-	m_payload.endpoint = endpoint;
-}
-
-QueuedCallback::QueuedCallback(CallbackEvent event, SocketBase* socket, SocketError errorType, int errorCode)
-	: m_event(event) {
-	m_socketWrapper = g_SocketManager.FindWrapper(socket);
-	m_payload.errorType = errorType;
-	m_payload.errorCode = errorCode;
-}
-
-bool QueuedCallback::IsValid() const {
-	if (!m_socketWrapper) return false;
-	if (m_event == CallbackEvent::Incoming && !m_payload.newSocket) return false;
-	return true;
-}
-
-bool QueuedCallback::IsExecutable() const {
-	if (!m_socketWrapper) return false;
-
-	auto* socket = m_socketWrapper->socket;
-	if (!socket) return false;
-
-	return socket->GetCallback(m_event).function != nullptr;
-}
-
-void QueuedCallback::Execute() {
-	if (!IsValid()) return;
-	ExecuteImpl();
-}
-
-void QueuedCallback::ExecuteImpl() {
-	auto* socket = m_socketWrapper->socket;
-	if (!socket) return;
-
-	auto& callbackInfo = socket->GetCallback(m_event);
-	if (!callbackInfo.function) return;
-
-	switch (m_event) {
-		case CallbackEvent::Connect:
-			callbackInfo.function->PushCell(socket->m_smHandle);
-			callbackInfo.function->PushCell(callbackInfo.data);
-			callbackInfo.function->Execute(nullptr);
-			break;
-
-		case CallbackEvent::Disconnect:
-			callbackInfo.function->PushCell(socket->m_smHandle);
-			callbackInfo.function->PushCell(callbackInfo.data);
-			callbackInfo.function->Execute(nullptr);
-			if (socket->GetOption(SocketOption::AutoClose) && socket->m_smHandle) {
-				HandleSecurity security(callbackInfo.function->GetParentContext()->GetIdentity(), myself->GetIdentity());
-				handlesys->FreeHandle(socket->m_smHandle, &security);
-			}
-			break;
-
-		case CallbackEvent::Listen:
-			callbackInfo.function->PushCell(socket->m_smHandle);
-			callbackInfo.function->PushString(m_payload.endpoint.address.c_str());
-			callbackInfo.function->PushCell(m_payload.endpoint.port);
-			callbackInfo.function->PushCell(callbackInfo.data);
-			callbackInfo.function->Execute(nullptr);
-			break;
-
-		case CallbackEvent::Incoming:
-			if (m_payload.newSocket) {
-				auto* newSocketWrapper = g_SocketManager.FindWrapper(m_payload.newSocket);
-				if (newSocketWrapper) {
-					m_payload.newSocket->m_smHandle = handlesys->CreateHandle(
-						g_SocketHandleType,
-						newSocketWrapper,
-						callbackInfo.function->GetParentContext()->GetIdentity(),
-						myself->GetIdentity(),
-						nullptr);
-
-					callbackInfo.function->PushCell(socket->m_smHandle);
-					callbackInfo.function->PushCell(m_payload.newSocket->m_smHandle);
-					callbackInfo.function->PushString(m_payload.endpoint.address.c_str());
-					callbackInfo.function->PushCell(m_payload.endpoint.port);
-					callbackInfo.function->PushCell(callbackInfo.data);
-					callbackInfo.function->Execute(nullptr);
-				}
-			}
-			break;
-
-		case CallbackEvent::Receive: {
-			size_t dataLength = m_payload.receiveData.length();
-			callbackInfo.function->PushCell(socket->m_smHandle);
-			callbackInfo.function->PushStringEx(m_payload.receiveData.data(), dataLength + 1,
-				SM_PARAM_STRING_COPY | SM_PARAM_STRING_BINARY, 0);
-			callbackInfo.function->PushCell(static_cast<cell_t>(dataLength));
-			callbackInfo.function->PushString(m_payload.endpoint.address.c_str());
-			callbackInfo.function->PushCell(m_payload.endpoint.port);
-			callbackInfo.function->PushCell(callbackInfo.data);
-			callbackInfo.function->Execute(nullptr);
-			break;
+	if (!m_connectQueue.try_enqueue(std::move(event))) {
+		if (g_GlobalOptions.Get(SocketOption::DebugMode)) {
+			smutils->LogError(myself, "[Socket] Connect queue full, dropping event");
 		}
-
-		case CallbackEvent::Error:
-			callbackInfo.function->PushCell(socket->m_smHandle);
-			callbackInfo.function->PushCell(static_cast<cell_t>(m_payload.errorType));
-			callbackInfo.function->PushCell(m_payload.errorCode);
-			callbackInfo.function->PushCell(callbackInfo.data);
-			callbackInfo.function->Execute(nullptr);
-			if (socket->GetOption(SocketOption::AutoClose) && socket->m_smHandle) {
-				HandleSecurity security(callbackInfo.function->GetParentContext()->GetIdentity(), myself->GetIdentity());
-				handlesys->FreeHandle(socket->m_smHandle, &security);
-			}
-			break;
-
-		default:
-			break;
 	}
 }
 
-void CallbackManager::Enqueue(std::unique_ptr<QueuedCallback> callback) {
-	std::scoped_lock lock(m_queueMutex);
+void CallbackManager::EnqueueDisconnect(SocketBase* socket) {
+	QueuedDisconnectEvent event;
+	event.socket = socket;
 
-	if (!callback->IsValid()) {
+	if (!m_disconnectQueue.try_enqueue(std::move(event))) {
 		if (g_GlobalOptions.Get(SocketOption::DebugMode)) {
-			smutils->LogError(myself, "[Socket] Invalid callback (event=%d)", static_cast<int>(callback->GetEvent()));
+			smutils->LogError(myself, "[Socket] Disconnect queue full, dropping event");
+		}
+	}
+}
+
+void CallbackManager::EnqueueListen(SocketBase* socket, const RemoteEndpoint& localEndpoint) {
+	QueuedListenEvent event;
+	event.socket = socket;
+	event.localEndpoint = localEndpoint;
+
+	if (!m_listenQueue.try_enqueue(std::move(event))) {
+		if (g_GlobalOptions.Get(SocketOption::DebugMode)) {
+			smutils->LogError(myself, "[Socket] Listen queue full, dropping event");
+		}
+	}
+}
+
+void CallbackManager::EnqueueIncoming(SocketBase* socket, SocketBase* newSocket, const RemoteEndpoint& remoteEndpoint) {
+	QueuedIncomingEvent event;
+	event.socket = socket;
+	event.newSocket = newSocket;
+	event.remoteEndpoint = remoteEndpoint;
+
+	if (!m_incomingQueue.try_enqueue(std::move(event))) {
+		if (g_GlobalOptions.Get(SocketOption::DebugMode)) {
+			smutils->LogError(myself, "[Socket] Incoming queue full, dropping event");
+		}
+	}
+}
+
+void CallbackManager::EnqueueReceive(SocketBase* socket, const char* data, size_t length) {
+	RemoteEndpoint emptyEndpoint;
+	EnqueueReceive(socket, data, length, emptyEndpoint);
+}
+
+void CallbackManager::EnqueueReceive(SocketBase* socket, const char* data, size_t length, const RemoteEndpoint& sender) {
+	// Allocate buffer for data (consumer will free)
+	char* dataCopy = static_cast<char*>(malloc(length + 1));
+	if (!dataCopy) {
+		if (g_GlobalOptions.Get(SocketOption::DebugMode)) {
+			smutils->LogError(myself, "[Socket] Failed to allocate memory for receive data");
 		}
 		return;
 	}
+	memcpy(dataCopy, data, length);
+	dataCopy[length] = '\0';
 
-	m_queue.push_back(std::move(callback));
-}
+	QueuedDataEvent event;
+	event.socket = socket;
+	event.data = dataCopy;
+	event.length = length;
+	event.sender = sender;
 
-void CallbackManager::Enqueue(CallbackEvent event, SocketBase* socket) {
-	Enqueue(std::make_unique<QueuedCallback>(event, socket));
-}
-
-void CallbackManager::Enqueue(CallbackEvent event, SocketBase* socket, const RemoteEndpoint& localEndpoint) {
-	Enqueue(std::make_unique<QueuedCallback>(event, socket, localEndpoint));
-}
-
-void CallbackManager::Enqueue(CallbackEvent event, SocketBase* socket, const char* data, size_t length) {
-	Enqueue(std::make_unique<QueuedCallback>(event, socket, data, length));
-}
-
-void CallbackManager::Enqueue(CallbackEvent event, SocketBase* socket, const char* data, size_t length, const RemoteEndpoint& sender) {
-	Enqueue(std::make_unique<QueuedCallback>(event, socket, data, length, sender));
-}
-
-void CallbackManager::Enqueue(CallbackEvent event, SocketBase* socket, SocketBase* newSocket) {
-	RemoteEndpoint endpoint;
-	if (newSocket->GetType() == SocketType::Tcp) {
-		endpoint = static_cast<TcpSocket*>(newSocket)->GetRemoteEndpoint();
+	if (!m_dataQueue.try_enqueue(std::move(event))) {
+		free(dataCopy);
+		if (g_GlobalOptions.Get(SocketOption::DebugMode)) {
+			smutils->LogError(myself, "[Socket] Data queue full, dropping event");
+		}
 	}
-	Enqueue(std::make_unique<QueuedCallback>(event, socket, newSocket, endpoint));
 }
 
-void CallbackManager::Enqueue(CallbackEvent event, SocketBase* socket, SocketError errorType, int errorCode) {
-	Enqueue(std::make_unique<QueuedCallback>(event, socket, errorType, errorCode));
+void CallbackManager::EnqueueError(SocketBase* socket, SocketError errorType, const char* errorMsg) {
+	QueuedErrorEvent event;
+	event.socket = socket;
+	event.errorType = errorType;
+	event.errorMsg = errorMsg;
+
+	if (!m_errorQueue.try_enqueue(std::move(event))) {
+		if (g_GlobalOptions.Get(SocketOption::DebugMode)) {
+			smutils->LogError(myself, "[Socket] Error queue full, dropping event");
+		}
+	}
 }
 
-void CallbackManager::RemoveByWrapper(SocketWrapper* wrapper) {
-	std::scoped_lock lock(m_queueMutex);
+bool CallbackManager::IsSocketValid(SocketBase* socket) const {
+	if (!socket) return false;
+	if (socket->IsDeleted()) return false;
+	return true;
+}
 
-	m_queue.erase(
-		std::remove_if(m_queue.begin(), m_queue.end(),
-			[wrapper](const std::unique_ptr<QueuedCallback>& callback) {
-				return callback->GetSocketWrapper() == wrapper;
-			}),
-		m_queue.end());
+bool CallbackManager::HasPendingCallbacks() const {
+	return !m_connectQueue.empty() ||
+	       !m_disconnectQueue.empty() ||
+	       !m_listenQueue.empty() ||
+	       !m_incomingQueue.empty() ||
+	       !m_dataQueue.empty() ||
+	       !m_errorQueue.empty();
 }
 
 void CallbackManager::ProcessPendingCallbacks() {
 	int maxCallbacks = g_GlobalOptions.Get(SocketOption::CallbacksPerFrame);
-	for (int callbackIndex = 0; callbackIndex < maxCallbacks; ++callbackIndex) {
-		auto callback = DequeueNext();
-		if (!callback) return;
-		callback->Execute();
+	int processed = 0;
+
+	// Process callbacks in round-robin fashion across all queues
+	// Order: Connect -> Listen -> Incoming -> Data -> Disconnect -> Error
+	while (processed < maxCallbacks) {
+		bool anyProcessed = false;
+
+		// Connect events
+		QueuedConnectEvent connectEvent;
+		if (m_connectQueue.try_dequeue(connectEvent)) {
+			ExecuteConnect(connectEvent);
+			++processed;
+			anyProcessed = true;
+			if (processed >= maxCallbacks) break;
+		}
+
+		// Listen events
+		QueuedListenEvent listenEvent;
+		if (m_listenQueue.try_dequeue(listenEvent)) {
+			ExecuteListen(listenEvent);
+			++processed;
+			anyProcessed = true;
+			if (processed >= maxCallbacks) break;
+		}
+
+		// Incoming connection events
+		QueuedIncomingEvent incomingEvent;
+		if (m_incomingQueue.try_dequeue(incomingEvent)) {
+			ExecuteIncoming(incomingEvent);
+			++processed;
+			anyProcessed = true;
+			if (processed >= maxCallbacks) break;
+		}
+
+		// Data receive events
+		QueuedDataEvent dataEvent;
+		if (m_dataQueue.try_dequeue(dataEvent)) {
+			ExecuteReceive(dataEvent);
+			++processed;
+			anyProcessed = true;
+			if (processed >= maxCallbacks) break;
+		}
+
+		// Disconnect events
+		QueuedDisconnectEvent disconnectEvent;
+		if (m_disconnectQueue.try_dequeue(disconnectEvent)) {
+			ExecuteDisconnect(disconnectEvent);
+			++processed;
+			anyProcessed = true;
+			if (processed >= maxCallbacks) break;
+		}
+
+		// Error events
+		QueuedErrorEvent errorEvent;
+		if (m_errorQueue.try_dequeue(errorEvent)) {
+			ExecuteError(errorEvent);
+			++processed;
+			anyProcessed = true;
+			if (processed >= maxCallbacks) break;
+		}
+
+		// No more events in any queue
+		if (!anyProcessed) break;
 	}
 }
 
-std::unique_ptr<QueuedCallback> CallbackManager::DequeueNext() {
-	std::scoped_lock lock(m_queueMutex);
+void CallbackManager::ExecuteConnect(const QueuedConnectEvent& event) {
+	if (!IsSocketValid(event.socket)) return;
 
-	for (auto it = m_queue.begin(); it != m_queue.end(); ++it) {
-		if ((*it)->IsExecutable()) {
-			auto callback = std::move(*it);
-			m_queue.erase(it);
-			return callback;
-		} else if (g_GlobalOptions.Get(SocketOption::DebugMode)) {
-			smutils->LogError(myself, "[Socket] Callback not executable (event=%d)", static_cast<int>((*it)->GetEvent()));
+	auto& callbackInfo = event.socket->GetCallback(CallbackEvent::Connect);
+	if (!callbackInfo.function) return;
+
+	callbackInfo.function->PushCell(event.socket->m_smHandle);
+	callbackInfo.function->PushCell(callbackInfo.data);
+	callbackInfo.function->Execute(nullptr);
+}
+
+void CallbackManager::ExecuteDisconnect(const QueuedDisconnectEvent& event) {
+	if (!IsSocketValid(event.socket)) return;
+
+	auto& callbackInfo = event.socket->GetCallback(CallbackEvent::Disconnect);
+	if (!callbackInfo.function) return;
+
+	callbackInfo.function->PushCell(event.socket->m_smHandle);
+	callbackInfo.function->PushCell(callbackInfo.data);
+	callbackInfo.function->Execute(nullptr);
+
+	if (event.socket->GetOption(SocketOption::AutoFreeHandle) && event.socket->m_smHandle) {
+		HandleSecurity security(callbackInfo.function->GetParentContext()->GetIdentity(), myself->GetIdentity());
+		handlesys->FreeHandle(event.socket->m_smHandle, &security);
+	}
+}
+
+void CallbackManager::ExecuteListen(const QueuedListenEvent& event) {
+	if (!IsSocketValid(event.socket)) return;
+
+	auto& callbackInfo = event.socket->GetCallback(CallbackEvent::Listen);
+	if (!callbackInfo.function) return;
+
+	callbackInfo.function->PushCell(event.socket->m_smHandle);
+	callbackInfo.function->PushString(event.localEndpoint.address.c_str());
+	callbackInfo.function->PushCell(event.localEndpoint.port);
+	callbackInfo.function->PushCell(callbackInfo.data);
+	callbackInfo.function->Execute(nullptr);
+}
+
+void CallbackManager::ExecuteIncoming(const QueuedIncomingEvent& event) {
+	if (!IsSocketValid(event.socket)) return;
+	if (!event.newSocket) return;
+
+	auto& callbackInfo = event.socket->GetCallback(CallbackEvent::Incoming);
+	if (!callbackInfo.function) return;
+
+	event.newSocket->m_smHandle = handlesys->CreateHandle(
+		g_SocketHandleType,
+		event.newSocket,
+		callbackInfo.function->GetParentContext()->GetIdentity(),
+		myself->GetIdentity(),
+		nullptr);
+
+	callbackInfo.function->PushCell(event.socket->m_smHandle);
+	callbackInfo.function->PushCell(event.newSocket->m_smHandle);
+	callbackInfo.function->PushString(event.remoteEndpoint.address.c_str());
+	callbackInfo.function->PushCell(event.remoteEndpoint.port);
+	callbackInfo.function->PushCell(callbackInfo.data);
+	callbackInfo.function->Execute(nullptr);
+}
+
+void CallbackManager::ExecuteReceive(const QueuedDataEvent& event) {
+	if (IsSocketValid(event.socket)) {
+		auto& callbackInfo = event.socket->GetCallback(CallbackEvent::Receive);
+		if (callbackInfo.function) {
+			callbackInfo.function->PushCell(event.socket->m_smHandle);
+			callbackInfo.function->PushStringEx(event.data, event.length + 1,
+				SM_PARAM_STRING_COPY | SM_PARAM_STRING_BINARY, 0);
+			callbackInfo.function->PushCell(static_cast<cell_t>(event.length));
+			callbackInfo.function->PushString(event.sender.address.c_str());
+			callbackInfo.function->PushCell(event.sender.port);
+			callbackInfo.function->PushCell(callbackInfo.data);
+			callbackInfo.function->Execute(nullptr);
 		}
 	}
+	free(event.data);
+}
 
-	return nullptr;
+void CallbackManager::ExecuteError(const QueuedErrorEvent& event) {
+	if (!IsSocketValid(event.socket)) return;
+
+	auto& callbackInfo = event.socket->GetCallback(CallbackEvent::Error);
+	if (!callbackInfo.function) return;
+
+	callbackInfo.function->PushCell(event.socket->m_smHandle);
+	callbackInfo.function->PushCell(static_cast<cell_t>(event.errorType));
+	callbackInfo.function->PushString(event.errorMsg);
+	callbackInfo.function->PushCell(callbackInfo.data);
+	callbackInfo.function->Execute(nullptr);
+
+	if (event.socket->GetOption(SocketOption::AutoFreeHandle) && event.socket->m_smHandle) {
+		HandleSecurity security(callbackInfo.function->GetParentContext()->GetIdentity(), myself->GetIdentity());
+		handlesys->FreeHandle(event.socket->m_smHandle, &security);
+	}
 }
