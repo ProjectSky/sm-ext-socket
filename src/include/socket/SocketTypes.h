@@ -18,7 +18,9 @@
 class SocketBase;
 class TcpSocket;
 class UdpSocket;
+#ifndef _WIN32
 class UnixSocket;
+#endif
 class EventLoop;
 
 enum class SocketType {

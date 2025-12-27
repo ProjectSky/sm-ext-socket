@@ -10,7 +10,6 @@
  *   sm_wsclose                         - Close connection
  *
  * Testing (start a local WS server first):
- *   - Python: python -c "import asyncio,websockets;asyncio.run(websockets.serve(lambda w,p:asyncio.gather(w.send('Echo:'+m)async for m in w),port=8765))"
  *   - Node.js: npx wscat -l 8765
  *   - websocat: websocat -s 8765
  *   Then: sm_wsconnect localhost 8765 /

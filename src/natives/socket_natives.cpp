@@ -3,7 +3,9 @@
 #include "socket/SocketBase.h"
 #include "socket/TcpSocket.h"
 #include "socket/UdpSocket.h"
+#ifndef _WIN32
 #include "socket/UnixSocket.h"
+#endif
 #include "core/SocketManager.h"
 #include <cstring>
 #include <string_view>
@@ -51,9 +53,12 @@ static cell_t SocketCreate(IPluginContext* context, const cell_t* params) {
 		socket = g_SocketManager.CreateSocket<TcpSocket>();
 	} else if (type == SocketType::Udp) {
 		socket = g_SocketManager.CreateSocket<UdpSocket>();
-	} else {
+	}
+#ifndef _WIN32
+	else if (type == SocketType::Unix) {
 		socket = g_SocketManager.CreateSocket<UnixSocket>();
 	}
+#endif
 
 	if (!socket) {
 		return context->ThrowNativeError("Failed to create socket");
@@ -274,9 +279,12 @@ static cell_t SocketGetLocalAddress(IPluginContext* context, const cell_t* param
 		address = static_cast<TcpSocket*>(socket)->GetLocalEndpoint().address;
 	} else if (socket->GetType() == SocketType::Udp) {
 		address = static_cast<UdpSocket*>(socket)->GetLocalEndpoint().address;
-	} else {
+	}
+#ifndef _WIN32
+	else if (socket->GetType() == SocketType::Unix) {
 		address = static_cast<UnixSocket*>(socket)->GetPath();
 	}
+#endif
 
 	char* destination = nullptr;
 	context->LocalToString(params[2], &destination);

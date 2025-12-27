@@ -126,8 +126,12 @@ methodmap Socket < Handle {
 	/**
 	 * Binds socket to local address
 	 *
-	 * @param address    Local IP or hostname
-	 * @param port       Local port
+	 * @note IPv4: Use "0.0.0.0" to listen on all interfaces, "127.0.0.1" for localhost
+	 * @note IPv6: Use "::" to listen on all interfaces, "::1" for localhost
+	 * @note Unix: address is the socket path, port is ignored
+	 *
+	 * @param address    Local IP or hostname (Unix: socket path)
+	 * @param port       Local port (Unix: ignored)
 	 * @return           True on success
 	 */
 	public native bool Bind(const char[] address, int port);

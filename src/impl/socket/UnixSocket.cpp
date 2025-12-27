@@ -1,3 +1,5 @@
+#ifndef _WIN32
+
 #include "socket/UnixSocket.h"
 #include "core/EventLoop.h"
 #include "core/CallbackManager.h"
@@ -161,28 +163,28 @@ void UnixSocket::OnConnection(uv_stream_t* server, int status) {
 		return;
 	}
 
-	auto* newSocket = g_SocketManager.CreateSocket<UnixSocket>();
-	newSocket->m_path = socket->m_path;
-
 	uv_pipe_t* client = new uv_pipe_t;
 	uv_pipe_init(g_EventLoop.GetLoop(), client, 0);
-	client->data = newSocket;
-
-	uv_pipe_t* expected = nullptr;
-	if (!newSocket->m_pipe.compare_exchange_strong(expected, client,
-		std::memory_order_release, std::memory_order_acquire)) {
-		uv_close(reinterpret_cast<uv_handle_t*>(client), OnClose);
-		return;
-	}
 
 	if (uv_accept(server, reinterpret_cast<uv_stream_t*>(client)) == 0) {
-		RemoteEndpoint remoteEndpoint;
-		remoteEndpoint.address = socket->m_path;
-		g_CallbackManager.EnqueueIncoming(socket, newSocket, remoteEndpoint);
-		newSocket->StartReading();
+		UnixSocket* newSocket = CreateFromAccepted(client, socket->m_path);
+		if (newSocket) {
+			RemoteEndpoint remoteEndpoint;
+			remoteEndpoint.address = socket->m_path;
+			g_CallbackManager.EnqueueIncoming(socket, newSocket, remoteEndpoint);
+			newSocket->StartReading();
+		}
 	} else {
-		g_SocketManager.DestroySocket(newSocket);
+		uv_close(reinterpret_cast<uv_handle_t*>(client), OnClose);
 	}
+}
+
+UnixSocket* UnixSocket::CreateFromAccepted(uv_pipe_t* clientHandle, const std::string& path) {
+	auto* socket = g_SocketManager.CreateSocket<UnixSocket>();
+	socket->m_path = path;
+	socket->m_pipe.store(clientHandle, std::memory_order_release);
+	clientHandle->data = socket;
+	return socket;
 }
 
 bool UnixSocket::Send(std::string_view data, bool async) {
@@ -277,3 +279,5 @@ void UnixSocket::OnClose(uv_handle_t* handle) {
 		delete reinterpret_cast<uv_pipe_t*>(handle);
 	}
 }
+
+#endif // _WIN32

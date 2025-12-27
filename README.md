@@ -1,7 +1,7 @@
 # SourceMod Socket Extension
 
 ## What is this?
-This is a [SourceMod](http://www.sourcemod.net/) extension that provides TCP and UDP socket communication capabilities.<br>
+This is a [SourceMod](http://www.sourcemod.net/) extension that provides TCP/UDP/UDS socket communication capabilities.<br>
 A complete rewrite of the [original socket extension](https://github.com/JoinedSenses/sm-ext-socket) with modern C++17 and libuv.
 
 ## Features
@@ -36,3 +36,6 @@ ambuild
 
 ## Example
 * [Example Scripts](https://github.com/ProjectSky/sm-ext-socket/tree/main/scripting)
+
+## TODO
+* [ ] SSL/TLS support (low priority - complex to implement, use dedicated HTTP libraries for HTTPS)

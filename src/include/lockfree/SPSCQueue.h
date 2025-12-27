@@ -3,7 +3,6 @@
 #include <atomic>
 #include <cstddef>
 #include <new>
-#include <type_traits>
 #include <utility>
 
 #ifdef __cpp_lib_hardware_interference_size
@@ -18,6 +17,9 @@ constexpr size_t kCacheLineSize = 64;
  * Based on a bounded ring buffer with separate cache-line aligned
  * head and tail indices to prevent false sharing.
  *
+ * Note: Actual usable capacity is (Capacity - 1) because one slot
+ * is reserved to distinguish between empty and full states.
+ *
  * Thread safety:
  * - Only ONE thread may call try_enqueue() (producer)
  * - Only ONE thread may call try_dequeue() (consumer)
@@ -30,15 +32,19 @@ constexpr size_t kCacheLineSize = 64;
  */
 template<typename T, size_t Capacity = 1024>
 class SPSCQueue {
-	static_assert(Capacity > 0, "Capacity must be greater than 0");
+	static_assert(Capacity > 1, "Capacity must be greater than 1");
 	static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of 2 for efficient modulo");
 
 public:
 	SPSCQueue() = default;
 	~SPSCQueue() {
-		// Destroy any remaining elements
-		T item;
-		while (try_dequeue(item)) {}
+		// Destroy remaining elements in place without moving
+		size_t head = m_head.load(std::memory_order_relaxed);
+		const size_t tail = m_tail.load(std::memory_order_relaxed);
+		while (head != tail) {
+			reinterpret_cast<T*>(&m_buffer[head])->~T();
+			head = (head + 1) & kMask;
+		}
 	}
 
 	SPSCQueue(const SPSCQueue&) = delete;
@@ -137,14 +143,20 @@ public:
 	}
 
 	/**
-	 * Get the capacity of the queue.
+	 * Get the usable capacity of the queue.
+	 * @return Capacity - 1 (one slot reserved for empty/full distinction)
 	 */
 	[[nodiscard]] static constexpr size_t capacity() {
-		return Capacity;
+		return Capacity - 1;
 	}
 
 private:
 	static constexpr size_t kMask = Capacity - 1;
+
+	// Storage wrapper ensuring proper alignment for each element
+	struct alignas(alignof(T)) Storage {
+		unsigned char data[sizeof(T)];
+	};
 
 	// Producer-owned: tail index and cached head
 	alignas(kCacheLineSize) std::atomic<size_t> m_tail{0};
@@ -154,6 +166,6 @@ private:
 	alignas(kCacheLineSize) std::atomic<size_t> m_head{0};
 	size_t m_cachedTail{0};
 
-	// Buffer storage (aligned to cache line)
-	alignas(kCacheLineSize) typename std::aligned_storage<sizeof(T), alignof(T)>::type m_buffer[Capacity];
+	// Buffer storage (cache-line aligned, each element aligned to T)
+	alignas(kCacheLineSize) Storage m_buffer[Capacity];
 };

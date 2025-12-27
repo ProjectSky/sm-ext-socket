@@ -1,5 +1,7 @@
 #pragma once
 
+#ifndef _WIN32
+
 #include "socket/SocketBase.h"
 #include <uv.h>
 #include <atomic>
@@ -12,6 +14,8 @@
  * - m_pipe: atomic pointer for lock-free access
  * - m_acceptor: atomic pointer for server socket
  * - All other state follows SocketBase thread safety model
+ *
+ * Note: Unix sockets are not available on Windows.
  */
 class UnixSocket : public SocketBase {
 public:
@@ -29,6 +33,12 @@ public:
 	bool SetOption(SocketOption option, int value) override;
 
 	[[nodiscard]] std::string GetPath() const { return m_path; }
+
+	/**
+	 * Create a UnixSocket from an accepted client handle.
+	 * Called from UV thread during OnConnection.
+	 */
+	static UnixSocket* CreateFromAccepted(uv_pipe_t* clientHandle, const std::string& path);
 
 private:
 	void InitPipe();
@@ -52,3 +62,5 @@ private:
 	static constexpr size_t kRecvBufferSize = 16384;
 	char m_recvBuffer[kRecvBufferSize];
 };
+
+#endif // _WIN32

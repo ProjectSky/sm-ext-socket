@@ -4,18 +4,17 @@
 #include "socket/SocketBase.h"
 #include "socket/TcpSocket.h"
 #include "socket/UdpSocket.h"
+#ifndef _WIN32
 #include "socket/UnixSocket.h"
-#include "lockfree/LockFreeMap.h"
+#endif
+#include <unordered_set>
 
 /**
- * Lock-free socket manager using LockFreeMap.
+ * Socket manager for tracking active sockets.
  *
  * Thread model:
- * - Game thread: creates and destroys sockets
- * - UV thread: looks up sockets for callback enqueuing
- *
- * The LockFreeMap allows concurrent reads from UV thread while
- * game thread performs modifications.
+ * - All operations are called from game thread only
+ * - UV thread uses socket->IsDeleted() atomic flag for validation
  */
 class SocketManager {
 public:
@@ -26,12 +25,6 @@ public:
 	SocketManager& operator=(const SocketManager&) = delete;
 
 	void Shutdown();
-
-	/**
-	 * Check if a socket exists and is not deleted.
-	 * Thread-safe, can be called from any thread.
-	 */
-	bool IsValidSocket(const SocketBase* socket);
 
 	/**
 	 * Create a new socket of the specified type.
@@ -50,14 +43,13 @@ public:
 	void Stop();
 
 private:
-	// Lock-free set for socket registry (value is just a marker, we use the key)
-	LockFreeMap<const SocketBase*, bool> m_socketMap;
+	std::unordered_set<SocketBase*> m_sockets;
 };
 
 template<typename T>
 T* SocketManager::CreateSocket() {
 	T* socket = new T();
-	m_socketMap.insert(socket, true);
+	m_sockets.insert(socket);
 	return socket;
 }
 

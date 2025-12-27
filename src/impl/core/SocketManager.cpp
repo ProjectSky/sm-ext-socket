@@ -1,11 +1,10 @@
 #include "core/SocketManager.h"
 #include "core/EventLoop.h"
-#include <cassert>
 
 SocketManager g_SocketManager;
 
 SocketManager::~SocketManager() {
-	if (!m_socketMap.empty()) {
+	if (!m_sockets.empty()) {
 		Shutdown();
 	}
 }
@@ -14,27 +13,20 @@ void SocketManager::Shutdown() {
 	Stop();
 
 	// Delete all sockets
-	m_socketMap.for_each([](const SocketBase* key, bool) {
-		delete const_cast<SocketBase*>(key);
-	});
-
-	m_socketMap.clear();
-}
-
-bool SocketManager::IsValidSocket(const SocketBase* socket) {
-	if (!socket) return false;
-	if (socket->IsDeleted()) return false;
-	return m_socketMap.find(socket);
+	for (auto* socket : m_sockets) {
+		delete socket;
+	}
+	m_sockets.clear();
 }
 
 void SocketManager::DestroySocket(SocketBase* socket) {
-	assert(socket);
+	if (!socket) return;
 
 	// Mark as deleted first
 	socket->MarkDeleted();
 
-	// Remove from map
-	m_socketMap.remove(socket);
+	// Remove from set
+	m_sockets.erase(socket);
 
 	// Delete socket
 	delete socket;
